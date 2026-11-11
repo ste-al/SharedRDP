@@ -12,8 +12,9 @@
     prepares this computer like a shared machine (AllowRemoteRPC=1), creates a
     temporary member of Remote Desktop Users and checks over the network with
     -Credential as that account, once as HOST\name and once as the bare name,
-    then removes the account. It also sends a takeover request to this
-    computer's session that times out after a few seconds.
+    and once with a wrong password, which has to come back as a rejected
+    sign-in; then it removes the account. It also sends a takeover request to
+    this computer's session that times out after a few seconds.
 
     The local check must work. Network checks that fail are reported as
     warnings, because they depend on how the machine is set up.
@@ -86,6 +87,15 @@ function Invoke-StatusCheck {
 
 Write-Line ('PowerShell {0} ({1}), {2}, running as {3}' -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition, [Environment]::OSVersion.VersionString, [System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
 
+# The engine's functions, for the checks below that call them directly.
+$module = New-Module -Name SharedRdpEngine -ArgumentList $enginePath -ScriptBlock {
+    param($Path)
+    . $Path
+    Export-ModuleMember -Function *
+}
+$null = $module | Import-Module -DisableNameChecking -Force -PassThru
+Initialize-Native
+
 # 1. This computer by name: no network involved. This one must work.
 $local = @(Invoke-StatusCheck -Title ('This computer by name ({0})' -f $env:COMPUTERNAME) -Arguments @{ ComputerName = $env:COMPUTERNAME })
 if ($local.Count -ne 1) {
@@ -138,6 +148,19 @@ if ($CiSetup -and $address) {
                 Write-Problem -Warning -Title ('network check as {0}' -f $userName) -Message $checked[0].Error
             }
         }
+        # A wrong password has to come back as a rejected sign-in: "Notify me" and
+        # the dashboard stop trying it, so that the account is not locked out.
+        $wrong = New-Object System.Security.SecureString
+        foreach ($character in 'not-the-password'.ToCharArray()) { $wrong.AppendChar($character) }
+        $userName = '{0}\{1}' -f $env:COMPUTERNAME, $name
+        $credential = New-Object System.Management.Automation.PSCredential -ArgumentList $userName, $wrong
+        $checked = @(Invoke-StatusCheck -Title ('This computer over the network as {0} with a wrong password' -f $userName) -Arguments @{ ComputerName = $address; Credential = $credential })
+        if ($checked.Count -eq 1) {
+            Write-Line ('  Error code {0}; counts as a rejected sign-in: {1}' -f $checked[0].ErrorCode, (Test-SignInRejected -Code $checked[0].ErrorCode)) 'White'
+            if (-not (Test-SignInRejected -Code $checked[0].ErrorCode)) {
+                Write-Problem -Warning -Title 'wrong password' -Message ('expected a rejected sign-in, got {0}: {1} {2}' -f $checked[0].Status, $checked[0].Detail, $checked[0].Error)
+            }
+        }
     }
     catch {
         Write-Problem -Warning -Title 'temporary account' -Message $_.Exception.Message
@@ -153,13 +176,6 @@ if ($CiSetup -and $local.Count -eq 1 -and $null -ne $local[0].Session) {
     Write-Line
     Write-Line ('Asking session {0} to let someone take over, with a 3-second timeout' -f $sessionId) 'Cyan'
     try {
-        $module = New-Module -Name SharedRdpEngine -ArgumentList $enginePath -ScriptBlock {
-            param($Path)
-            . $Path
-            Export-ModuleMember -Function *
-        }
-        $null = $module | Import-Module -DisableNameChecking -Force -PassThru
-        Initialize-Native
         $ask = Get-AskMessage -TimeoutSeconds 3
         $answer = Send-AskMessage -ComputerName $env:COMPUTERNAME -SessionId $sessionId -Title $ask.Title -Message $ask.Message -TimeoutSeconds 3 -Credential ([System.Management.Automation.PSCredential]::Empty)
         Write-Line ('  Answer code {0}; 32000 means nobody answered in time, as expected here.' -f $answer) 'White'
