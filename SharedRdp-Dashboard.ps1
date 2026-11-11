@@ -743,6 +743,8 @@ function New-Dot {
 
 function Add-Cell {
     param($Grid, [int] $Column, $Element, [int] $Span = 1)
+    # A gap after each text column, so long names never run into the next one.
+    if ($Column -ge 1 -and $Column + $Span - 1 -le 4) { $Element.Margin = New-Thickness 0 0 12 0 }
     [System.Windows.Controls.Grid]::SetColumn($Element, $Column)
     if ($Span -gt 1) { [System.Windows.Controls.Grid]::SetColumnSpan($Element, $Span) }
     $null = $Grid.Children.Add($Element)
@@ -1939,6 +1941,9 @@ $script:ui.LogToggle.Add_Click({
         if ($show) {
             $script:ui.LogToggle.Content = 'Hide the log'
             $script:ui.LogBox.ScrollToEnd()
+            # On short screens the page scrolls; show the log, not just its button.
+            $script:ui.LogBox.UpdateLayout()
+            $script:ui.LogBox.BringIntoView()
         }
         else {
             $script:ui.LogToggle.Content = 'Show the step-by-step log'
