@@ -115,7 +115,8 @@ busiest one decides.
   other person is asked first.
 - **Tell me when it's free** checks again every 30 seconds and plays a sound,
   flashes the taskbar button and shows a notification when the session is free
-  or disconnected. Keep the window open.
+  or disconnected. It keeps watching that machine while you check others. Keep
+  the window open.
 - **Look up their last client in the event log** appears when Windows no longer
   reports where a session was connected from, which is always the case for
   disconnected sessions.
@@ -123,10 +124,14 @@ busiest one decides.
   copy it or save it to a file.
 
 The password is kept in memory until the window closes and is never written to
-disk. The machine and account names of recent checks are saved in
+disk. When the machine rejects it, the dashboard forgets it and stops checking
+that machine on its own (*Re-check* and *Tell me when it's free*) until you
+type it again: wrong passwords tried every 30 seconds would soon lock the
+account out. The machine and account names of recent checks are saved in
 `%APPDATA%\SharedRdp\dashboard.json`, so you can check them again with one
-click. A bare account name such as `Administrator` means a local account on
-that machine, shown as `MACHINE\Administrator`.
+click, or with the arrow keys and Enter. A bare account name such as
+`Administrator` means a local account on that machine, shown as
+`MACHINE\Administrator`.
 
 Options, for a shortcut or the console:
 
@@ -153,7 +158,9 @@ Options, for a shortcut or the console:
 If the machine is free, or disconnected for longer than 15 minutes, Remote
 Desktop starts right away. Otherwise you choose: connect anyway, ask them, watch,
 get notified when it is free, refresh, or quit. With several machines you get a
-table and pick one; Enter takes the suggested free machine.
+table and pick one; Enter takes the suggested free machine. *Notify me* stops
+as soon as the machine rejects the `-Credential` password, so that it cannot
+lock the account out.
 
 | Parameter | Meaning |
 |---|---|
@@ -217,14 +224,18 @@ GitHub-hosted Windows runner:
 - `Test-Scripts.ps1`: syntax in Windows PowerShell 5.1 and PowerShell 7,
   ASCII-only files, both C# parts compiled, the window layout loaded in the
   light and dark theme at two sizes, the status logic and the dashboard's
-  wording on made-up sessions, and a background check of the runner.
-- `Invoke-Analyzer.ps1`: PSScriptAnalyzer; errors fail the run.
+  wording on made-up sessions, the port test over IPv4 and IPv6, and a
+  background check of the runner.
+- `Invoke-Analyzer.ps1`: PSScriptAnalyzer with every rule except the few that
+  `PSScriptAnalyzerSettings.psd1` leaves out, each with its reason; errors and
+  warnings fail the run.
 - `Test-CommandLine.ps1`: the command line against the runner, locally and
-  over the network, with a temporary account and a takeover request that
-  times out.
+  over the network, with a temporary account, a wrong password that has to
+  come back as a rejected sign-in, and a takeover request that times out.
 - `Test-Dashboard.ps1`: opens the dashboard through the .cmd file, lets it
-  check the runner, reads the window through UI Automation, and takes
-  screenshots in both themes.
+  check the runner, starts and stops watching, checks again from the list of
+  recent machines with a click and with Enter, reads the window through UI
+  Automation, and takes screenshots in both themes.
 
 The screenshots and logs are kept with each run, under *Artifacts*. To run the
 checks that change nothing on your own computer:
