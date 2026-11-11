@@ -1,0 +1,51 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v6
+
+      - name: Scripts in Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\Test-Scripts.ps1 -OutputPath out
+
+      - name: Scripts in PowerShell 7
+        if: success() || failure()
+        shell: pwsh
+        run: .\tests\Test-Scripts.ps1
+
+      - name: PSScriptAnalyzer
+        if: success() || failure()
+        shell: pwsh
+        run: .\tests\Invoke-Analyzer.ps1
+
+      - name: Command line, checking this runner
+        if: success() || failure()
+        shell: powershell
+        run: .\tests\Test-CommandLine.ps1 -CiSetup -OutputPath out
+
+      - name: Dashboard, checking this runner
+        if: success() || failure()
+        shell: powershell
+        run: .\tests\Test-Dashboard.ps1 -Dark -OutputPath out
+
+      - name: Keep the screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: screenshots-and-logs
+          path: out/
+          if-no-files-found: ignore

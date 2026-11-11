@@ -1,0 +1,5 @@
+# Screenshots and logs written by the checks in tests/
+out/
+
+# Logs written with Connect-SharedRdp.ps1 -LogPath
+*.log
