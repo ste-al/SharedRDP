@@ -53,7 +53,9 @@
     Account used for the check only (not for the Remote Desktop sign-in).
     Checking as the shared account itself usually works without extra
     permissions, because you are then looking at your own account's session.
-    A bare user name means a local account on the target.
+    A bare user name means a local account on the target. When the target
+    rejects the account or its password, "Notify me" stops instead of trying
+    it again and again, which could lock the account out.
 
 .PARAMETER StatusOnly
     Report only: outputs one object per machine (pipe it to Format-List *,
@@ -173,7 +175,7 @@ param(
     [string] $LogPath
 )
 
-$script:ScriptVersion = '1.4'
+$script:ScriptVersion = '1.5'
 
 #region Native layer (Remote Desktop Services API)
 
@@ -184,7 +186,9 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security;
 
-namespace SharedRdpV1
+// The namespace changes with the code, because a PowerShell session keeps the
+// first compiled copy of a type and cannot load a changed one under that name.
+namespace SharedRdpV2
 {
     public sealed class SessionRecord
     {
@@ -544,10 +548,12 @@ namespace SharedRdpV1
             return FormatAddress(a.AddressFamily, a.Address);
         }
 
-        internal static string FormatAddress(int family, byte[] a)
+        // The IP address starts two bytes into Address, for IPv4 and IPv6 alike
+        // (see the remarks on WTS_CLIENT_ADDRESS).
+        public static string FormatAddress(int family, byte[] a)
         {
-            if (a == null || a.Length < 16) return null;
-            if (family == 2)                // AF_INET: the IPv4 bytes start at offset 2
+            if (a == null || a.Length < 18) return null;
+            if (family == 2)                // AF_INET
             {
                 if (a[2] == 0 && a[3] == 0 && a[4] == 0 && a[5] == 0) return null;
                 return string.Format("{0}.{1}.{2}.{3}", a[2], a[3], a[4], a[5]);
@@ -555,7 +561,7 @@ namespace SharedRdpV1
             if (family == 23)               // AF_INET6
             {
                 byte[] b = new byte[16];
-                Array.Copy(a, 0, b, 0, 16);
+                Array.Copy(a, 2, b, 0, 16);
                 bool empty = true;
                 foreach (byte x in b) { if (x != 0) { empty = false; break; } }
                 if (empty) return null;
@@ -656,32 +662,32 @@ namespace SharedRdpV1
 '@
 
 function Initialize-Native {
-    if (-not ('SharedRdpV1.Wts' -as [type])) {
+    if (-not ('SharedRdpV2.Wts' -as [type])) {
         Add-Type -TypeDefinition $script:NativeSource -Language CSharp -ErrorAction Stop
     }
 }
 
 function Get-RawSessions {
-    param([string] $ComputerName, $Credential)
+    param([string] $ComputerName, [System.Management.Automation.PSCredential] $Credential)
     $c = ConvertTo-NativeCredential -Credential $Credential -ComputerName $ComputerName
     if ($c.User) {
         $signIn = $c.User
         if ($c.Domain) { $signIn = '{0}\{1}' -f $c.Domain, $c.User }
-        Write-Log -Message ('{0}: network sign-in as {1} with the password given' -f $ComputerName, $signIn)
+        Write-CheckLog -Message ('{0}: network sign-in as {1} with the password given' -f $ComputerName, $signIn)
     }
-    [SharedRdpV1.Wts]::GetSessions($ComputerName, $c.Domain, $c.User, $c.Password)
+    [SharedRdpV2.Wts]::GetSessions($ComputerName, $c.Domain, $c.User, $c.Password)
 }
 
 function Get-RawProcesses {
-    param([string] $ComputerName, $Credential)
+    param([string] $ComputerName, [System.Management.Automation.PSCredential] $Credential)
     $c = ConvertTo-NativeCredential -Credential $Credential -ComputerName $ComputerName
-    [SharedRdpV1.Wts]::GetProcesses($ComputerName, $c.Domain, $c.User, $c.Password)
+    [SharedRdpV2.Wts]::GetProcesses($ComputerName, $c.Domain, $c.User, $c.Password)
 }
 
 function Send-AskMessage {
-    param([string] $ComputerName, [int] $SessionId, [string] $Title, [string] $Message, [int] $TimeoutSeconds, $Credential)
+    param([string] $ComputerName, [int] $SessionId, [string] $Title, [string] $Message, [int] $TimeoutSeconds, [System.Management.Automation.PSCredential] $Credential)
     $c = ConvertTo-NativeCredential -Credential $Credential -ComputerName $ComputerName
-    [SharedRdpV1.Wts]::AskSession($ComputerName, $SessionId, $Title, $Message, $TimeoutSeconds, $c.Domain, $c.User, $c.Password)
+    [SharedRdpV2.Wts]::AskSession($ComputerName, $SessionId, $Title, $Message, $TimeoutSeconds, $c.Domain, $c.User, $c.Password)
 }
 
 #endregion
@@ -709,7 +715,7 @@ function Get-NetbiosGuess {
 }
 
 function ConvertTo-NativeCredential {
-    param($Credential, [string] $ComputerName)
+    param([System.Management.Automation.PSCredential] $Credential, [string] $ComputerName)
     if ($null -eq $Credential -or $Credential -eq [System.Management.Automation.PSCredential]::Empty) {
         return [pscustomobject]@{ Domain = $null; User = $null; Password = $null }
     }
@@ -746,7 +752,7 @@ function Get-SystemSessionMeaning {
 function ConvertTo-TargetCredential {
     # The -Credential account with the domain part the session query uses: a bare
     # user name means a local account on the target (HOST\user).
-    param($Credential, [string] $ComputerName)
+    param([System.Management.Automation.PSCredential] $Credential, [string] $ComputerName)
     if ($null -eq $Credential -or $Credential -eq [System.Management.Automation.PSCredential]::Empty) { return $null }
     $c = ConvertTo-NativeCredential -Credential $Credential -ComputerName $ComputerName
     $name = [string] $c.User
@@ -771,6 +777,27 @@ function Split-HostPort {
         return [pscustomobject]@{ Host = $Matches['h']; Port = $Matches['p'] }
     }
     return [pscustomobject]@{ Host = $a; Port = $null }
+}
+
+function Format-MstscHost {
+    # mstsc reads /v:host:port, so a bare IPv6 address goes in brackets.
+    param([string] $Address)
+    $a = ([string] $Address).Trim()
+    $ip = $null
+    if ($a.Contains(':') -and -not $a.StartsWith('[') -and [System.Net.IPAddress]::TryParse($a, [ref] $ip) -and
+        $ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+        return ('[{0}]' -f $a)
+    }
+    return $a
+}
+
+function Test-SignInRejected {
+    # True for the Win32 errors that mean the machine or its domain refused the
+    # account or its password. Trying the same password again cannot help, and
+    # every try counts toward the account's lockout threshold.
+    param($Code)
+    if ($null -eq $Code) { return $false }
+    return (@(86, 1244, 1312, 1326, 1327, 1328, 1329, 1330, 1331, 1385, 1907, 1909) -contains [int] $Code)
 }
 
 function ConvertFrom-FileTime {
@@ -887,7 +914,7 @@ function Get-FailureHint {
             }
             return ('{0}On Windows 10/11 the target needs AllowRemoteRPC=1, and the checking account needs permission to query sessions there: members of Remote Desktop Users have it, otherwise {1}.' -f $as, $useShared)
         }
-        { $_ -in 86, 1244, 1312, 1326, 1327, 1329, 1330, 1331, 1385, 1907, 1909 } {
+        { Test-SignInRejected -Code $_ } {
             return ('{0}That machine did not accept this sign-in. {1}' -f $as, $signInFix)
         }
         { $_ -in 1717, 1722, 1723, 1726, 1727, 1745, 1753 } {
@@ -968,7 +995,7 @@ function Format-FileTimeForLog {
     return $t.ToString('yyyy-MM-dd HH:mm:ss') + 'Z'
 }
 
-function Write-Log {
+function Write-CheckLog {
     # Verbose and Warning lines go to their PowerShell streams; with -LogPath
     # every line is also appended to the file. 'File' lines go only to the file.
     param([ValidateSet('Verbose', 'Warning', 'File')] [string] $Level = 'Verbose', [string] $Message = '')
@@ -1222,40 +1249,53 @@ function Resolve-HostStatus {
 }
 
 function Test-TcpPort {
-    param([string] $HostName, [int] $Port, [int] $TimeoutMs = 1500)
-    $client = New-Object System.Net.Sockets.TcpClient
-    try {
-        $attempt = $client.BeginConnect($HostName, $Port, $null, $null)
-        if (-not $attempt.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
-        $client.EndConnect($attempt)
-        return $true
+    # 'open' when one of the addresses accepts a connection on the port, or else
+    # why not: 'no answer', or the error of the last address tried. Each address
+    # gets a socket of its own family: the default TcpClient of Windows
+    # PowerShell 5.1 is IPv4 only, so it could never reach an IPv6 address.
+    param([System.Net.IPAddress[]] $Address, [int] $Port, [int] $TimeoutMs = 1500)
+    $why = 'no address to try'
+    foreach ($ip in @($Address | Where-Object { $null -ne $_ } | Select-Object -First 4)) {
+        $client = $null
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient -ArgumentList $ip.AddressFamily
+            $attempt = $client.BeginConnect($ip, $Port, $null, $null)
+            if ($attempt.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+                $client.EndConnect($attempt)
+                return 'open'
+            }
+            $why = 'no answer'
+        }
+        catch {
+            $why = $_.Exception.GetBaseException().Message.Trim()
+        }
+        finally {
+            if ($null -ne $client) { $client.Close() }
+        }
     }
-    catch { return $false }
-    finally { $client.Close() }
+    return $why
 }
 
 function Test-QueryReachable {
     param([string] $HostName)
     $ok = [pscustomobject]@{ Ok = $true; Reason = ''; Text = '' }
     if (Test-IsLocalName -Name $HostName) {
-        Write-Log -Message ('{0}: this computer, no network check needed' -f $HostName)
+        Write-CheckLog -Message ('{0}: this computer, no network check needed' -f $HostName)
         return $ok
     }
     try {
-        $addresses = @([System.Net.Dns]::GetHostAddresses($HostName) | ForEach-Object { $_.IPAddressToString })
-        Write-Log -Message ('{0}: resolves to {1}' -f $HostName, ($addresses -join ', '))
+        $addresses = @([System.Net.Dns]::GetHostAddresses($HostName))
+        Write-CheckLog -Message ('{0}: resolves to {1}' -f $HostName, (@($addresses | ForEach-Object { $_.IPAddressToString }) -join ', '))
     }
     catch {
-        Write-Log -Message ('{0}: name resolution failed: {1}' -f $HostName, (Format-ExceptionChain -ErrorRecord $_))
+        Write-CheckLog -Message ('{0}: name resolution failed: {1}' -f $HostName, (Format-ExceptionChain -ErrorRecord $_))
         return [pscustomobject]@{ Ok = $false; Reason = 'name not found'; Text = ("Can't resolve '{0}': {1}" -f $HostName, $_.Exception.GetBaseException().Message) }
     }
     foreach ($port in 445, 135) {
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
-        $open = Test-TcpPort -HostName $HostName -Port $port
-        $state = 'closed or filtered'
-        if ($open) { $state = 'open' }
-        Write-Log -Message ('{0}: TCP {1} {2} ({3} ms)' -f $HostName, $port, $state, $watch.ElapsedMilliseconds)
-        if ($open) { return $ok }
+        $state = Test-TcpPort -Address $addresses -Port $port
+        Write-CheckLog -Message ('{0}: TCP {1} {2} ({3} ms)' -f $HostName, $port, $state, $watch.ElapsedMilliseconds)
+        if ($state -eq 'open') { return $ok }
     }
     return [pscustomobject]@{
         Ok     = $false
@@ -1265,12 +1305,12 @@ function Test-QueryReachable {
 }
 
 function Get-BusySessionMap {
-    param([string] $ComputerName, $Credential, [string[]] $Pattern)
+    param([string] $ComputerName, [System.Management.Automation.PSCredential] $Credential, [string[]] $Pattern)
     $map = @{}
     $patterns = @($Pattern | Where-Object { $_ } | ForEach-Object { $_ -replace '\.exe$', '' })
     if ($patterns.Count -eq 0) { return $map }
     $all = @(Get-RawProcesses -ComputerName $ComputerName -Credential $Credential)
-    Write-Log -Message ('{0}: {1} processes listed, looking for {2}' -f $ComputerName, $all.Count, ($patterns -join ', '))
+    Write-CheckLog -Message ('{0}: {1} processes listed, looking for {2}' -f $ComputerName, $all.Count, ($patterns -join ', '))
     foreach ($p in $all) {
         if ($null -eq $p -or -not $p.Name) { continue }
         $base = $p.Name -replace '\.exe$', ''
@@ -1279,7 +1319,7 @@ function Get-BusySessionMap {
                 $key = [int] $p.SessionId
                 if (-not $map.ContainsKey($key)) { $map[$key] = New-Object System.Collections.Generic.List[string] }
                 if (-not $map[$key].Contains([string] $p.Name)) { $map[$key].Add([string] $p.Name) }
-                Write-Log -Message ('{0}: busy process {1} (PID {2}) in session {3}' -f $ComputerName, $p.Name, $p.ProcessId, $key)
+                Write-CheckLog -Message ('{0}: busy process {1} (PID {2}) in session {3}' -f $ComputerName, $p.Name, $p.ProcessId, $key)
                 break
             }
         }
@@ -1291,7 +1331,7 @@ function Get-HostStatus {
     param([Parameter(Mandatory = $true)] $Target, [Parameter(Mandatory = $true)] [hashtable] $Settings)
     $total = [System.Diagnostics.Stopwatch]::StartNew()
     if ($Settings.SkipPortCheck) {
-        Write-Log -Message ('{0}: port check skipped' -f $Target.QueryHost)
+        Write-CheckLog -Message ('{0}: port check skipped' -f $Target.QueryHost)
     }
     else {
         $reach = Test-QueryReachable -HostName $Target.QueryHost
@@ -1300,30 +1340,30 @@ function Get-HostStatus {
             $result = New-UnknownResult -Target $Target -Reason $reach.Reason -Text $reach.Text
             $result.CheckedAs = [string] $Settings.CheckingAs
             $result.DurationMs = $total.ElapsedMilliseconds
-            Write-Log -Message ('{0}: UNKNOWN - {1}' -f $Target.Name, $reach.Text)
+            Write-CheckLog -Message ('{0}: UNKNOWN - {1}' -f $Target.Name, $reach.Text)
             return $result
         }
     }
-    Write-Log -Message ('{0}: querying sessions as {1}' -f $Target.QueryHost, $Settings.CheckingAs)
+    Write-CheckLog -Message ('{0}: querying sessions as {1}' -f $Target.QueryHost, $Settings.CheckingAs)
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $raw = @(Get-RawSessions -ComputerName $Target.QueryHost -Credential $Settings.Credential)
     }
     catch {
         $failure = Get-FailureText -ErrorRecord $_ -Operation Query -Settings $Settings
-        Write-Log -Message ('{0}: session query failed after {1} ms: {2}' -f $Target.QueryHost, $watch.ElapsedMilliseconds, (Format-ExceptionChain -ErrorRecord $_))
-        Write-Log -Message ('{0}: UNKNOWN - {1}' -f $Target.Name, $failure.Text)
+        Write-CheckLog -Message ('{0}: session query failed after {1} ms: {2}' -f $Target.QueryHost, $watch.ElapsedMilliseconds, (Format-ExceptionChain -ErrorRecord $_))
+        Write-CheckLog -Message ('{0}: UNKNOWN - {1}' -f $Target.Name, $failure.Text)
         $result = New-UnknownResult -Target $Target -Reason $failure.Reason -Text $failure.Text -Code $failure.Code
         $result.CheckedAs = [string] $Settings.CheckingAs
         $result.DurationMs = $total.ElapsedMilliseconds
         return $result
     }
-    Write-Log -Message ('{0}: {1} sessions in {2} ms' -f $Target.QueryHost, $raw.Count, $watch.ElapsedMilliseconds)
+    Write-CheckLog -Message ('{0}: {1} sessions in {2} ms' -f $Target.QueryHost, $raw.Count, $watch.ElapsedMilliseconds)
     foreach ($r in $raw) {
         if ($null -eq $r) { continue }
         $who = '(nobody: {0})' -f (Get-SystemSessionMeaning -Name $r.WinStationName -State $r.State)
         if ($r.UserName) { $who = '"{0}\{1}"' -f $r.DomainName, $r.UserName }
-        Write-Log -Message ('{0}:   session {1} "{2}" state={3} user={4} lockFlag={5} logon={6} connect={7} disconnect={8} lastInput={9} now={10} client="{11}" address="{12}" protocol={13} display={14}x{15} problems="{16}"' -f
+        Write-CheckLog -Message ('{0}:   session {1} "{2}" state={3} user={4} lockFlag={5} logon={6} connect={7} disconnect={8} lastInput={9} now={10} client="{11}" address="{12}" protocol={13} display={14}x{15} problems="{16}"' -f
             $Target.QueryHost, $r.SessionId, $r.WinStationName, (Get-StateName -State $r.State), $who, $r.Flags,
             (Format-FileTimeForLog -Value $r.LogonTime), (Format-FileTimeForLog -Value $r.ConnectTime), (Format-FileTimeForLog -Value $r.DisconnectTime),
             (Format-FileTimeForLog -Value $r.LastInputTime), (Format-FileTimeForLog -Value $r.CurrentTime),
@@ -1338,8 +1378,8 @@ function Get-HostStatus {
         catch {
             $failure = Get-FailureText -ErrorRecord $_ -Operation Processes -Settings $Settings
             $notes += ('busy check skipped: {0}' -f $failure.Reason)
-            Write-Log -Level Warning -Message ('{0}: busy check skipped: {1}' -f $Target.QueryHost, $failure.Text)
-            Write-Log -Message ('{0}: process list failed: {1}' -f $Target.QueryHost, (Format-ExceptionChain -ErrorRecord $_))
+            Write-CheckLog -Level Warning -Message ('{0}: busy check skipped: {1}' -f $Target.QueryHost, $failure.Text)
+            Write-CheckLog -Message ('{0}: process list failed: {1}' -f $Target.QueryHost, (Format-ExceptionChain -ErrorRecord $_))
         }
     }
     $views = @()
@@ -1376,7 +1416,7 @@ function Get-HostStatus {
     $result.DurationMs = $total.ElapsedMilliseconds
     $whoPart = ''
     if ($result.Who) { $whoPart = ' - ' + $result.Who }
-    Write-Log -Message ('{0}: {1} - {2}{3}' -f $Target.Name, (Get-StatusLabel -Status $result.Status), $result.Detail, $whoPart)
+    Write-CheckLog -Message ('{0}: {1} - {2}{3}' -f $Target.Name, (Get-StatusLabel -Status $result.Status), $result.Detail, $whoPart)
     return $result
 }
 
@@ -1396,7 +1436,7 @@ function Get-LastClientMap {
     # disconnected session; this log keeps it until the log wraps. Reading it
     # remotely needs the target's "Remote Event Log Management" firewall rules and
     # an account that may read its logs (Administrators or Event Log Readers).
-    param([string] $ComputerName, $Credential, [int] $MaxEvents = 3000)
+    param([string] $ComputerName, [System.Management.Automation.PSCredential] $Credential, [int] $MaxEvents = 3000)
     $query = @{
         FilterHashtable = @{ LogName = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'; Id = 21, 24, 25 }
         MaxEvents       = $MaxEvents
@@ -1408,7 +1448,7 @@ function Get-LastClientMap {
         $networkCredential = ConvertTo-TargetCredential -Credential $Credential -ComputerName $ComputerName
         if ($null -ne $networkCredential) { $query.Credential = $networkCredential }
     }
-    Write-Log -Message ('{0}: reading the Remote Desktop session log (newest {1} sign-in, disconnect and reconnect events)' -f $ComputerName, $MaxEvents)
+    Write-CheckLog -Message ('{0}: reading the Remote Desktop session log (newest {1} sign-in, disconnect and reconnect events)' -f $ComputerName, $MaxEvents)
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $events = @()
     try {
@@ -1416,7 +1456,7 @@ function Get-LastClientMap {
     }
     catch {
         if ([string] $_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {
-            Write-Log -Message ('{0}: the session log has no sign-in, disconnect or reconnect events' -f $ComputerName)
+            Write-CheckLog -Message ('{0}: the session log has no sign-in, disconnect or reconnect events' -f $ComputerName)
             return @{}
         }
         throw
@@ -1445,7 +1485,7 @@ function Get-LastClientMap {
             Address   = $address
         })
     }
-    Write-Log -Message ('{0}: {1} events in {2} ms; client addresses for sessions {3}' -f $ComputerName, $events.Count, $watch.ElapsedMilliseconds, (@($map.Keys | Sort-Object) -join ', '))
+    Write-CheckLog -Message ('{0}: {1} events in {2} ms; client addresses for sessions {3}' -f $ComputerName, $events.Count, $watch.ElapsedMilliseconds, (@($map.Keys | Sort-Object) -join ', '))
     return $map
 }
 
@@ -1584,7 +1624,10 @@ function Test-QuitKey {
             if ($key.Key -eq [ConsoleKey]::Q -or $key.Key -eq [ConsoleKey]::Escape) { return $true }
         }
     }
-    catch { }
+    catch {
+        # No console to read keys from (input redirected): only Ctrl+C stops.
+        return $false
+    }
     return $false
 }
 
@@ -1606,20 +1649,20 @@ function Start-Rdp {
     param([Parameter(Mandatory = $true)] $Target, [string[]] $ExtraArgument = @())
     $parts = New-Object System.Collections.Generic.List[string]
     if ($Target.RdpFile) { $parts.Add(('"{0}"' -f $Target.RdpFile)) }
-    if (-not $Target.RdpFile -or $Target.OverrideHost) { $parts.Add(('/v:{0}' -f $Target.Name)) }
+    if (-not $Target.RdpFile -or $Target.OverrideHost) { $parts.Add(('/v:{0}' -f (Format-MstscHost -Address $Target.Name))) }
     foreach ($a in @($ExtraArgument)) { if ($a) { $parts.Add([string] $a) } }
     $line = $parts -join ' '
     Write-Host ('Starting Remote Desktop: mstsc {0}' -f $line) -ForegroundColor DarkGray
-    Write-Log -Level File -Message ('Starting Remote Desktop: mstsc {0}' -f $line)
+    Write-CheckLog -Level File -Message ('Starting Remote Desktop: mstsc {0}' -f $line)
     Start-Process -FilePath 'mstsc.exe' -ArgumentList $line
 }
 
 function Start-Shadow {
     param([Parameter(Mandatory = $true)] $Target, [int] $SessionId, [switch] $NoConsentPrompt)
-    $line = '/v:{0} /shadow:{1}' -f $Target.QueryHost, $SessionId
+    $line = '/v:{0} /shadow:{1}' -f (Format-MstscHost -Address $Target.QueryHost), $SessionId
     if ($NoConsentPrompt) { $line += ' /noConsentPrompt' }
     Write-Host ('Opening a view-only window: mstsc {0}' -f $line) -ForegroundColor DarkGray
-    Write-Log -Level File -Message ('Opening a view-only window: mstsc {0}' -f $line)
+    Write-CheckLog -Level File -Message ('Opening a view-only window: mstsc {0}' -f $line)
     Start-Process -FilePath 'mstsc.exe' -ArgumentList $line
 }
 
@@ -1647,11 +1690,11 @@ function Invoke-AskTakeover {
     catch {
         $failure = Get-FailureText -ErrorRecord $_ -Operation Ask -Settings $Settings
         Write-Host ("Couldn't send the request: {0}" -f $failure.Text) -ForegroundColor Yellow
-        Write-Log -Level File -Message ("Couldn't send the request: {0}" -f $failure.Text)
-        Write-Log -Message ('Ask failed: {0}' -f (Format-ExceptionChain -ErrorRecord $_))
+        Write-CheckLog -Level File -Message ("Couldn't send the request: {0}" -f $failure.Text)
+        Write-CheckLog -Message ('Ask failed: {0}' -f (Format-ExceptionChain -ErrorRecord $_))
         return 'Failed'
     }
-    Write-Log -Message ('Ask: session {0} on {1} answered with code {2} (6 = Yes, 7 = No, 32000 = timed out)' -f $Result.SessionId, $Target.QueryHost, $response)
+    Write-CheckLog -Message ('Ask: session {0} on {1} answered with code {2} (6 = Yes, 7 = No, 32000 = timed out)' -f $Result.SessionId, $Target.QueryHost, $response)
     switch ([int] $response) {
         6     { return 'Yes' }
         7     { return 'No' }
@@ -1671,14 +1714,21 @@ function Wait-UntilFree {
         }
         $st = Get-HostStatus -Target $Target -Settings $Settings
         if ($st.Status -eq 'Unknown' -and $st.Status -ne $lastStatus) {
-            Write-Log -Level Warning -Message ('{0}: {1}' -f $Target.Name, $st.Error)
+            Write-CheckLog -Level Warning -Message ('{0}: {1}' -f $Target.Name, $st.Error)
         }
         if ($st.Status -ne $lastStatus) {
             Write-Host ('{0:HH:mm:ss}  {1}  {2}' -f (Get-Date), (Get-StatusLabel -Status $st.Status), $st.Detail)
             $lastStatus = $st.Status
         }
+        if ($st.Status -eq 'Unknown' -and (Test-SignInRejected -Code $st.ErrorCode)) {
+            # Every further try with this password would count toward a lockout.
+            $stop = 'Stopped watching: {0} does not accept this sign-in, and trying it again could lock the account out.' -f $Target.Name
+            Write-Host $stop -ForegroundColor Yellow
+            Write-CheckLog -Level File -Message $stop
+            return 'Quit'
+        }
         if ($st.Status -eq 'Free' -or $st.Status -eq 'Disconnected') {
-            try { [Console]::Beep(880, 250) } catch { }
+            try { [Console]::Beep(880, 250) } catch { Write-Verbose 'This console cannot beep.' }
             $label = (Get-StatusLabel -Status $st.Status).ToLower()
             $answer = Show-Popup -Text ('{0} is {1} ({2}). Connect now?' -f $Target.Name, $label, $st.Detail) -Title 'Shared Remote Desktop'
             if ($answer -eq 'Yes') { return 'Connect' }
@@ -1697,14 +1747,14 @@ function Invoke-HostFlow {
         $st = Get-HostStatus -Target $Target -Settings $Settings
         Show-HostStatus -Result $st
         $auto = Get-AutoAction -Result $st -RecentDisconnectMinutes $Settings.RecentDisconnectMinutes
-        Write-Log -Message ('{0}: status {1}, next step {2}' -f $Target.Name, $st.Status, $auto)
+        Write-CheckLog -Message ('{0}: status {1}, next step {2}' -f $Target.Name, $st.Status, $auto)
         if ($auto -eq 'Connect') {
             Start-Rdp -Target $Target -ExtraArgument $Settings.MstscArgument
             return 'Connected'
         }
         $menu = Get-MenuFor -Result $st
         $choice = Read-Choice -Option $menu.Options -Default $menu.Default
-        Write-Log -Level File -Message ('{0}: chose {1}' -f $Target.Name, $choice)
+        Write-CheckLog -Level File -Message ('{0}: chose {1}' -f $Target.Name, $choice)
         switch ($choice) {
             { $_ -eq 'Connect' -or $_ -eq 'ConnectNow' } {
                 Start-Rdp -Target $Target -ExtraArgument $Settings.MstscArgument
@@ -1778,7 +1828,7 @@ function Select-Target {
     }
     $rows | Format-Table -AutoSize | Out-Host
     foreach ($r in $results) {
-        if ($r.Status -eq 'Unknown') { Write-Log -Level Warning -Message ('{0}: {1}' -f $r.ComputerName, $r.Error) }
+        if ($r.Status -eq 'Unknown') { Write-CheckLog -Level Warning -Message ('{0}: {1}' -f $r.ComputerName, $r.Error) }
     }
     $suggest = Get-SuggestedIndex -Result $results
     $prompt = 'Connect to which one? Number, or Q to quit'
@@ -1812,7 +1862,7 @@ function Read-RdpFile {
 }
 
 function Resolve-Targets {
-    param([string[]] $ComputerName, [string] $RdpFile, [string] $UserName, $Credential)
+    param([string[]] $ComputerName, [string] $RdpFile, [string] $UserName, [System.Management.Automation.PSCredential] $Credential)
     $rdp = $null
     $rdpPath = ''
     if ($RdpFile) {
@@ -1847,7 +1897,7 @@ function Resolve-Targets {
 }
 
 function Get-CheckingIdentity {
-    param($Credential)
+    param([System.Management.Automation.PSCredential] $Credential)
     if ($null -ne $Credential -and $Credential -ne [System.Management.Automation.PSCredential]::Empty) {
         return ('{0} (from -Credential)' -f $Credential.UserName)
     }
@@ -1866,6 +1916,11 @@ if ($MyInvocation.InvocationName -ne '.') {
     $script:LogFile = $null
     if ($LogPath) {
         $script:LogFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)
+        $logFolder = Split-Path -Parent $script:LogFile
+        if ($logFolder -and -not (Test-Path -LiteralPath $logFolder)) {
+            try { $null = New-Item -ItemType Directory -Path $logFolder -Force -ErrorAction Stop }
+            catch { Write-Warning ('Could not create the folder for the log file: {0}' -f $_.Exception.Message) }
+        }
         Write-Host ('Logging to {0}' -f $script:LogFile) -ForegroundColor DarkGray
     }
     $shown = foreach ($key in $PSBoundParameters.Keys) {
@@ -1874,14 +1929,14 @@ if ($MyInvocation.InvocationName -ne '.') {
         elseif ($value -is [array]) { $value = $value -join ',' }
         '{0}={1}' -f $key, $value
     }
-    Write-Log -Message ('Connect-SharedRdp {0} on PowerShell {1} ({2}, {3}-bit), {4}' -f $script:ScriptVersion, $PSVersionTable.PSVersion, $PSVersionTable.PSEdition, ([IntPtr]::Size * 8), [Environment]::OSVersion.VersionString)
-    Write-Log -Message ('Parameters: {0}' -f ($shown -join '; '))
+    Write-CheckLog -Message ('Connect-SharedRdp {0} on PowerShell {1} ({2}, {3}-bit), {4}' -f $script:ScriptVersion, $PSVersionTable.PSVersion, $PSVersionTable.PSEdition, ([IntPtr]::Size * 8), [Environment]::OSVersion.VersionString)
+    Write-CheckLog -Message ('Parameters: {0}' -f ($shown -join '; '))
     try {
         Initialize-Native
     }
     catch {
         $loadError = 'Could not load the Remote Desktop Services API wrapper: {0}' -f (Format-ExceptionChain -ErrorRecord $_)
-        Write-Log -Level File -Message $loadError
+        Write-CheckLog -Level File -Message $loadError
         Write-Error $loadError
         exit 1
     }
@@ -1897,22 +1952,22 @@ if ($MyInvocation.InvocationName -ne '.') {
         SkipPortCheck           = [bool] $SkipPortCheck
         CheckingAs              = (Get-CheckingIdentity -Credential $Credential)
     }
-    Write-Log -Message ('Checking as {0}' -f $settings.CheckingAs)
+    Write-CheckLog -Message ('Checking as {0}' -f $settings.CheckingAs)
     try {
         $targets = @(Resolve-Targets -ComputerName $ComputerName -RdpFile $RdpFile -UserName $UserName -Credential $Credential)
     }
     catch {
-        Write-Log -Level File -Message $_.Exception.Message
+        Write-CheckLog -Level File -Message $_.Exception.Message
         Write-Error $_.Exception.Message
         exit 1
     }
     foreach ($t in $targets) {
-        Write-Log -Message ('Target {0}: query host {1}, shared account "{2}", rdp file "{3}", gateway "{4}"' -f $t.Name, $t.QueryHost, $t.TargetUser, $t.RdpFile, $t.Gateway)
+        Write-CheckLog -Message ('Target {0}: query host {1}, shared account "{2}", rdp file "{3}", gateway "{4}"' -f $t.Name, $t.QueryHost, $t.TargetUser, $t.RdpFile, $t.Gateway)
     }
     if ($StatusOnly) {
         foreach ($t in $targets) {
             $result = Get-HostStatus -Target $t -Settings $settings
-            if ($result.Status -eq 'Unknown') { Write-Log -Level Warning -Message ('{0}: {1}' -f $result.ComputerName, $result.Error) }
+            if ($result.Status -eq 'Unknown') { Write-CheckLog -Level Warning -Message ('{0}: {1}' -f $result.ComputerName, $result.Error) }
             $result
         }
         return
@@ -1921,6 +1976,6 @@ if ($MyInvocation.InvocationName -ne '.') {
     if ($targets.Count -gt 1) { $chosen = Select-Target -Target $targets -Settings $settings }
     if ($null -ne $chosen) {
         $outcome = Invoke-HostFlow -Target $chosen -Settings $settings
-        Write-Log -Message ('Done: {0}' -f $outcome)
+        Write-CheckLog -Message ('Done: {0}' -f $outcome)
     }
 }

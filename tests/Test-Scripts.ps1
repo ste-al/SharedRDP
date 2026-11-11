@@ -239,8 +239,8 @@ Test-Case 'the background job scripts parse and call engine functions correctly'
 
 Test-Case 'the Remote Desktop Services wrapper compiles' {
     Initialize-Native
-    $type = 'SharedRdpV1.Wts' -as [type]
-    Assert-True ($null -ne $type) 'type SharedRdpV1.Wts is missing'
+    $type = 'SharedRdpV2.Wts' -as [type]
+    Assert-True ($null -ne $type) 'type SharedRdpV2.Wts is missing'
     foreach ($method in 'GetSessions', 'GetProcesses', 'AskSession') {
         Assert-True (@($type.GetMethods() | Where-Object { $_.Name -eq $method }).Count -gt 0) ('method {0} is missing' -f $method)
     }
