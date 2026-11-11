@@ -9,6 +9,13 @@ one. These scripts read the machine's session list instead, which never touches
 a session, and say in plain words whether it is free, in use, idle, locked or
 disconnected, who is connected, from which computer, and since when.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/dashboard-dark.png">
+  <img src="docs/dashboard-light.png" alt="The dashboard after checking a machine: an In use sign, who is signed in and since when, the buttons Connect anyway, Ask to take over, Watch and Tell me when it's free, and the list of people signed in.">
+</picture>
+
+*The dashboard checking a GitHub Actions runner, from the checks in `tests/`.*
+
 ## What's here
 
 | File | What it is |

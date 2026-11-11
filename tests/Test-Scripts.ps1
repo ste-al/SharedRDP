@@ -521,6 +521,7 @@ Test-Case 'the console without input times: signed in, not claimed to be working
     $copy = Get-FriendlyText -Result $result -Request ([pscustomobject]@{ Host = 'LAB-07'; Account = 'tester' })
     Assert-Equal 'tester is signed in directly at LAB-07.' $copy.Headline 'headline'
     Assert-Match 'own screen' $copy.Advice 'advice'
+    Assert-Equal 'no input time for the console' (Get-StateDetail -Session $script:ConsoleUser) 'state in the table'
 }
 
 Test-Case 'unknown: says why' {

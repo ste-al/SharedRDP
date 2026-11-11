@@ -1186,6 +1186,7 @@ function Get-StateDetail {
         'Idle' { return ('no input for {0}' -f (Format-Span $Session.IdleTime)) }
         'InUse' {
             if ($null -ne $Session.IdleTime) { return ('last input {0} ago' -f (Format-Span $Session.IdleTime)) }
+            if ($Session.Protocol -eq 'Console') { return 'no input time for the console' }
             return [string] $Session.IdleNote
         }
         'Busy' { return (@($Session.BusyProcesses) -join ', ') }
