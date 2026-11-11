@@ -230,8 +230,8 @@ GitHub-hosted Windows runner:
   `PSScriptAnalyzerSettings.psd1` leaves out, each with its reason; errors and
   warnings fail the run.
 - `Test-CommandLine.ps1`: the command line against the runner, locally and
-  over the network, with a temporary account, a wrong password that has to
-  come back as a rejected sign-in, and a takeover request that times out.
+  over the network, with a temporary account and a takeover request that
+  times out.
 - `Test-Dashboard.ps1`: opens the dashboard through the .cmd file, lets it
   check the runner, starts and stops watching, checks again from the list of
   recent machines with a click and with Enter, reads the window through UI

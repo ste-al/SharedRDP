@@ -12,9 +12,13 @@
     prepares this computer like a shared machine (AllowRemoteRPC=1), creates a
     temporary member of Remote Desktop Users and checks over the network with
     -Credential as that account, once as HOST\name and once as the bare name,
-    and once with a wrong password, which has to come back as a rejected
-    sign-in; then it removes the account. It also sends a takeover request to
-    this computer's session that times out after a few seconds.
+    then removes the account. It also sends a takeover request to this
+    computer's session that times out after a few seconds.
+
+    A wrong password cannot be tried here: on a connection to itself, Windows
+    signs in with the caller's own account (as runas /netonly does), so this
+    computer accepts any password. Test-Scripts.ps1 checks which errors count
+    as a rejected sign-in, and that "Notify me" stops at one.
 
     The local check must work. Network checks that fail are reported as
     warnings, because they depend on how the machine is set up.
@@ -146,19 +150,6 @@ if ($CiSetup -and $address) {
             $checked = @(Invoke-StatusCheck -Title ('This computer over the network as {0}, a member of Remote Desktop Users' -f $userName) -Arguments @{ ComputerName = $address; Credential = $credential })
             if ($checked.Count -eq 1 -and $checked[0].Status -eq 'Unknown') {
                 Write-Problem -Warning -Title ('network check as {0}' -f $userName) -Message $checked[0].Error
-            }
-        }
-        # A wrong password has to come back as a rejected sign-in: "Notify me" and
-        # the dashboard stop trying it, so that the account is not locked out.
-        $wrong = New-Object System.Security.SecureString
-        foreach ($character in 'not-the-password'.ToCharArray()) { $wrong.AppendChar($character) }
-        $userName = '{0}\{1}' -f $env:COMPUTERNAME, $name
-        $credential = New-Object System.Management.Automation.PSCredential -ArgumentList $userName, $wrong
-        $checked = @(Invoke-StatusCheck -Title ('This computer over the network as {0} with a wrong password' -f $userName) -Arguments @{ ComputerName = $address; Credential = $credential })
-        if ($checked.Count -eq 1) {
-            Write-Line ('  Error code {0}; counts as a rejected sign-in: {1}' -f $checked[0].ErrorCode, (Test-SignInRejected -Code $checked[0].ErrorCode)) 'White'
-            if (-not (Test-SignInRejected -Code $checked[0].ErrorCode)) {
-                Write-Problem -Warning -Title 'wrong password' -Message ('expected a rejected sign-in, got {0}: {1} {2}' -f $checked[0].Status, $checked[0].Detail, $checked[0].Error)
             }
         }
     }

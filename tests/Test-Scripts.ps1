@@ -162,7 +162,8 @@ foreach ($scriptFile in $scriptFiles) {
 }
 
 Write-Section 'Text'
-$textFiles = @($scriptFiles) + @(Get-ChildItem -LiteralPath $root -Recurse -File -Include '*.psd1', '*.cmd' | Where-Object { $_.FullName -notmatch '[\\/]out[\\/]' })
+# Filtered by extension here: Windows PowerShell 5.1 ignores -Include next to -LiteralPath.
+$textFiles = @($scriptFiles) + @(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object { @('.psd1', '.cmd') -contains $_.Extension -and $_.FullName -notmatch '[\\/]out[\\/]' })
 foreach ($textFile in $textFiles) {
     Test-Case ('{0} is ASCII only' -f $textFile.Name) {
         $text = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($textFile.FullName))
