@@ -15,6 +15,11 @@
     then removes the account. It also sends a takeover request to this
     computer's session that times out after a few seconds.
 
+    A wrong password cannot be tried here: on a connection to itself, Windows
+    signs in with the caller's own account (as runas /netonly does), so this
+    computer accepts any password. Test-Scripts.ps1 checks which errors count
+    as a rejected sign-in, and that "Notify me" stops at one.
+
     The local check must work. Network checks that fail are reported as
     warnings, because they depend on how the machine is set up.
 
@@ -86,6 +91,15 @@ function Invoke-StatusCheck {
 
 Write-Line ('PowerShell {0} ({1}), {2}, running as {3}' -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition, [Environment]::OSVersion.VersionString, [System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
 
+# The engine's functions, for the checks below that call them directly.
+$module = New-Module -Name SharedRdpEngine -ArgumentList $enginePath -ScriptBlock {
+    param($Path)
+    . $Path
+    Export-ModuleMember -Function *
+}
+$null = $module | Import-Module -DisableNameChecking -Force -PassThru
+Initialize-Native
+
 # 1. This computer by name: no network involved. This one must work.
 $local = @(Invoke-StatusCheck -Title ('This computer by name ({0})' -f $env:COMPUTERNAME) -Arguments @{ ComputerName = $env:COMPUTERNAME })
 if ($local.Count -ne 1) {
@@ -153,13 +167,6 @@ if ($CiSetup -and $local.Count -eq 1 -and $null -ne $local[0].Session) {
     Write-Line
     Write-Line ('Asking session {0} to let someone take over, with a 3-second timeout' -f $sessionId) 'Cyan'
     try {
-        $module = New-Module -Name SharedRdpEngine -ArgumentList $enginePath -ScriptBlock {
-            param($Path)
-            . $Path
-            Export-ModuleMember -Function *
-        }
-        $null = $module | Import-Module -DisableNameChecking -Force -PassThru
-        Initialize-Native
         $ask = Get-AskMessage -TimeoutSeconds 3
         $answer = Send-AskMessage -ComputerName $env:COMPUTERNAME -SessionId $sessionId -Title $ask.Title -Message $ask.Message -TimeoutSeconds 3 -Credential ([System.Management.Automation.PSCredential]::Empty)
         Write-Line ('  Answer code {0}; 32000 means nobody answered in time, as expected here.' -f $answer) 'White'

@@ -102,7 +102,8 @@ function Get-ParsedFile {
 
 function Find-Ast {
     param($Ast, [type] $Type)
-    return @($Ast.FindAll({ param($node) $node -is $Type }.GetNewClosure(), $true))
+    $wanted = $Type
+    return @($Ast.FindAll({ param($node) $node -is $wanted }.GetNewClosure(), $true))
 }
 
 function Invoke-InSta {
@@ -149,7 +150,8 @@ Write-Host ('PowerShell {0} ({1}), {2}' -f $PSVersionTable.PSVersion, $PSVersion
 #region Syntax and text
 
 Write-Section 'Syntax'
-$scriptFiles = @(Get-ChildItem -LiteralPath $root -Filter '*.ps1' -Recurse -File | Where-Object { $_.FullName -notlike '*\out\*' })
+# out\ holds the screenshots and logs of earlier runs.
+$scriptFiles = @(Get-ChildItem -LiteralPath $root -Filter '*.ps1' -Recurse -File | Where-Object { $_.FullName -notmatch '[\\/]out[\\/]' })
 foreach ($scriptFile in $scriptFiles) {
     Test-Case ('{0} parses' -f $scriptFile.Name) {
         $parsed = Get-ParsedFile -Path $scriptFile.FullName
@@ -160,9 +162,11 @@ foreach ($scriptFile in $scriptFiles) {
 }
 
 Write-Section 'Text'
-foreach ($shipped in @($enginePath, $dashboardPath, $launcherPath)) {
-    Test-Case ('{0} is ASCII only' -f (Split-Path -Leaf $shipped)) {
-        $text = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($shipped))
+# Filtered by extension here: Windows PowerShell 5.1 ignores -Include next to -LiteralPath.
+$textFiles = @($scriptFiles) + @(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object { @('.psd1', '.cmd') -contains $_.Extension -and $_.FullName -notmatch '[\\/]out[\\/]' })
+foreach ($textFile in $textFiles) {
+    Test-Case ('{0} is ASCII only' -f $textFile.Name) {
+        $text = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($textFile.FullName))
         $match = [regex]::Match($text, '[^\x00-\x7F]')
         if ($match.Success) {
             $line = ($text.Substring(0, $match.Index) -split "`n").Count
@@ -239,11 +243,22 @@ Test-Case 'the background job scripts parse and call engine functions correctly'
 
 Test-Case 'the Remote Desktop Services wrapper compiles' {
     Initialize-Native
-    $type = 'SharedRdpV1.Wts' -as [type]
-    Assert-True ($null -ne $type) 'type SharedRdpV1.Wts is missing'
-    foreach ($method in 'GetSessions', 'GetProcesses', 'AskSession') {
+    $type = 'SharedRdpV2.Wts' -as [type]
+    Assert-True ($null -ne $type) 'type SharedRdpV2.Wts is missing'
+    foreach ($method in 'GetSessions', 'GetProcesses', 'AskSession', 'FormatAddress') {
         Assert-True (@($type.GetMethods() | Where-Object { $_.Name -eq $method }).Count -gt 0) ('method {0} is missing' -f $method)
     }
+}
+
+Test-Case 'client addresses start two bytes into WTS_CLIENT_ADDRESS, IPv4 and IPv6 alike' {
+    $v4 = New-Object byte[] 20
+    $v4[2] = 10; $v4[3] = 0; $v4[4] = 0; $v4[5] = 12
+    Assert-Equal '10.0.0.12' ([SharedRdpV2.Wts]::FormatAddress(2, $v4)) 'IPv4'
+    $v6 = New-Object byte[] 20
+    [Array]::Copy([System.Net.IPAddress]::Parse('2001:db8::5').GetAddressBytes(), 0, $v6, 2, 16)
+    Assert-Equal '2001:db8::5' ([SharedRdpV2.Wts]::FormatAddress(23, $v6)) 'IPv6'
+    Assert-True ($null -eq [SharedRdpV2.Wts]::FormatAddress(23, (New-Object byte[] 20))) 'an empty address should give none'
+    Assert-True ($null -eq [SharedRdpV2.Wts]::FormatAddress(0, $v4)) 'an unknown family should give none'
 }
 
 Test-Case 'the dashboard window helper compiles' {
@@ -453,6 +468,66 @@ Test-Case 'machine names, ports and account names' {
     Assert-Equal 'tester' (Get-UserLeaf -Name 'tester@lab.local') 'user@domain'
 }
 
+Test-Case 'mstsc gets IPv6 addresses in brackets' {
+    Assert-Equal '[fe80::1]' (Format-MstscHost -Address 'fe80::1') 'bare IPv6'
+    Assert-Equal '[fe80::1]:3390' (Format-MstscHost -Address '[fe80::1]:3390') 'IPv6 with port'
+    Assert-Equal 'LAB-07:3390' (Format-MstscHost -Address 'LAB-07:3390') 'name with port'
+    Assert-Equal $ipName (Format-MstscHost -Address $ipName) 'IPv4'
+}
+
+Test-Case 'a rejected sign-in is told apart from other failures' {
+    foreach ($code in 86, 1326, 1330, 1331, 1909) { Assert-True (Test-SignInRejected -Code $code) ('error {0} should count as a rejected sign-in' -f $code) }
+    foreach ($code in 5, 53, 259, 1722, $null) { Assert-True (-not (Test-SignInRejected -Code $code)) ('error [{0}] should not count as a rejected sign-in' -f $code) }
+    Assert-Match 'did not accept this sign-in' (Get-FailureHint -Code 1909 -HasCredential $true -Gui $true) 'advice for a locked-out account'
+}
+
+Test-Case 'the port test reaches IPv4 and IPv6 addresses' {
+    # Windows PowerShell's default TcpClient is IPv4 only; each address needs a
+    # socket of its own family.
+    foreach ($loopback in [System.Net.IPAddress]::Loopback, [System.Net.IPAddress]::IPv6Loopback) {
+        $listener = $null
+        try {
+            $listener = New-Object System.Net.Sockets.TcpListener -ArgumentList $loopback, 0
+            $listener.Start()
+        }
+        catch {
+            Write-Host ('        {0}: cannot listen here, skipped ({1})' -f $loopback, $_.Exception.GetBaseException().Message)
+            continue
+        }
+        $port = $listener.LocalEndpoint.Port
+        try { Assert-Equal 'open' (Test-TcpPort -Address $loopback -Port $port) ('a listening port on {0}' -f $loopback) }
+        finally { $listener.Stop() }
+        Assert-True ((Test-TcpPort -Address $loopback -Port $port) -ne 'open') ('a closed port on {0} should not count as open' -f $loopback)
+    }
+    Assert-Equal 'no address to try' (Test-TcpPort -Address $null -Port 445) 'no address'
+}
+
+Test-Case '"Notify me" stops at once when the machine rejects the password' {
+    # Each try with a wrong password counts toward the account's lockout. The
+    # engine is dot-sourced into a scope of its own, so that the check can be
+    # replaced there.
+    $report = & {
+        . $enginePath
+        $tries = @{ Count = 0 }
+        function Wait-OrQuit {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Seconds', Justification = 'Stands in for the real one, which waits.')]
+            param([int] $Seconds)
+            return $false
+        }
+        function Get-HostStatus {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Settings', Justification = 'Stands in for the real check.')]
+            param($Target, $Settings)
+            $tries.Count++
+            if ($tries.Count -gt 3) { throw 'it kept trying the rejected password' }
+            New-UnknownResult -Target $Target -Reason 'The user name or password is incorrect (error 1326)' -Text 'wrong password' -Code 1326
+        }
+        $outcome = Wait-UntilFree -Target ([pscustomobject]@{ Name = 'LAB-07'; QueryHost = 'LAB-07'; TargetUser = 'tester' }) -Settings @{ PollSeconds = 5 }
+        [pscustomobject]@{ Outcome = $outcome; Tries = $tries.Count }
+    } 3>$null 6>$null
+    Assert-Equal 'Quit' $report.Outcome 'outcome'
+    Assert-Equal 1 $report.Tries 'tries with the rejected password'
+}
+
 Test-Case 'a bare account name means a local account on the target' {
     $secure = New-Object System.Security.SecureString
     $secure.AppendChar('x')
@@ -498,10 +573,11 @@ Test-Case 'an unreachable machine gives advice that fits each window' {
 
 Write-Section 'Dashboard wording'
 # These dashboard functions only format text, so they can run without the window.
-$wording = @('Format-Span', 'Format-When', 'ConvertTo-Sentence', 'Get-FriendlyText', 'Get-ClientText', 'Get-StateDetail')
+$wording = @('Format-Span', 'Format-When', 'ConvertTo-Sentence', 'Get-FriendlyText', 'Get-ClientText', 'Get-StateDetail', 'Get-StatusWord', 'New-Fact', 'Get-FactList')
 foreach ($definition in (Find-Ast -Ast $dashboard.Ast -Type ([System.Management.Automation.Language.FunctionDefinitionAst]))) {
     if ($wording -contains $definition.Name) { . ([scriptblock]::Create($definition.Extent.Text)) }
 }
+$script:StatusWord = @(Get-AssignedExpression -Name '$script:StatusWord')[0].SafeGetValue()
 $request = [pscustomobject]@{ Host = 'LAB-07'; Account = 'Administrator' }
 
 Test-Case 'disconnected: nobody is watching' {
@@ -545,6 +621,27 @@ Test-Case 'where from: the event log fills in a disconnected session' {
     $text = Get-ClientText -Session $script:Disconnected -Lookup @{ Map = @{ 3 = $entries }; Error = '' }
     Assert-Equal '10.0.0.5' $text.Main 'address'
     Assert-Match '^disconnected .+, per the event log$' $text.Sub 'when'
+}
+
+Test-Case 'facts: someone else at the machine''s own screen is not "Not in use"' {
+    $result = Resolve-HostStatus -ComputerName $lab -Sessions @($script:ConsoleUser) -TargetUser 'Administrator'
+    $facts = @(Get-FactList -Result $result -Lookup $null)
+    Assert-Equal 4 $facts.Count 'facts'
+    Assert-Equal 'Its own screen' $facts[1].Label 'label'
+    Assert-Equal 'In use' $facts[1].Value 'value'
+    Assert-Equal 'tester, session 1' $facts[1].Sub 'who'
+    $result.SystemSessions = @([pscustomobject]@{ SessionId = 1; Name = 'Console'; State = 'Connected'; Meaning = '' })
+    $result.Sessions = @()
+    Assert-Equal 'Sign-in screen' @(Get-FactList -Result $result -Lookup $null)[1].Value 'nobody at the console'
+}
+
+Test-Case 'facts: a session''s state, sign-in, client and protocol' {
+    $result = Resolve-HostStatus -ComputerName $lab -Sessions @($script:IdleUser) -TargetUser 'tester'
+    $facts = @(Get-FactList -Result $result -Lookup $null)
+    Assert-Equal 'No input for' $facts[0].Label 'first label'
+    Assert-Equal '20 min' $facts[0].Value 'idle time'
+    Assert-Equal 'DESK-12' $facts[2].Value 'client'
+    Assert-Equal 'Remote Desktop' $facts[3].Sub 'protocol'
 }
 
 #endregion

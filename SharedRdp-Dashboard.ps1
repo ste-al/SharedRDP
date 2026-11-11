@@ -12,11 +12,13 @@
     connect, ask the person in the session to let you take over, watch their
     screen, or get a notification when the machine is free.
 
-    Keep this file next to Connect-SharedRdp.ps1 (version 1.3 or later): every
+    Keep this file next to Connect-SharedRdp.ps1 (version 1.5 or later): every
     check runs through it, in the background, so the window never freezes.
 
     The password is kept in memory until the window closes and is never written
-    to disk. Machine and account names of recent checks are remembered in
+    to disk. When the machine rejects it, the dashboard forgets it and stops
+    checking with it, so automatic checks cannot lock the account out. Machine
+    and account names of recent checks are remembered in
     %APPDATA%\SharedRdp\dashboard.json.
 
 .PARAMETER ComputerName
@@ -70,7 +72,7 @@ param(
     [string] $EnginePath
 )
 
-$script:DashboardVersion = '1.1'
+$script:DashboardVersion = '1.2'
 $script:Options = @{
     Host       = $ComputerName
     User       = $UserName
@@ -140,10 +142,10 @@ try {
         Export-ModuleMember -Function *
     }
     $null = $script:Engine | Import-Module -DisableNameChecking -PassThru
-    $needed = @('Get-HostStatus', 'Get-LastClientMap', 'Find-LastClient', 'Get-AskMessage', 'Get-SystemSessionMeaning', 'New-UnknownResult', 'Send-AskMessage')
+    $needed = @('Get-HostStatus', 'Get-LastClientMap', 'Find-LastClient', 'Get-AskMessage', 'Get-SystemSessionMeaning', 'New-UnknownResult', 'Send-AskMessage', 'Test-SignInRejected', 'Format-MstscHost')
     $missing = @($needed | Where-Object { -not $script:Engine.ExportedFunctions.ContainsKey($_) })
     if ($missing.Count -gt 0) {
-        throw ('this copy is too old for the dashboard (it lacks {0}); use version 1.3 or later' -f ($missing -join ', '))
+        throw ('this copy is too old for the dashboard (it lacks {0}); use version 1.5 or later' -f ($missing -join ', '))
     }
     Initialize-Native
     $script:EngineVersion = & $script:Engine { $script:ScriptVersion }
@@ -529,25 +531,25 @@ $script:XamlTemplate = @'
         </Border>
 
         <WrapPanel x:Name="Actions" Grid.Row="2" Margin="0,14,0,0">
-          <Button x:Name="ConnectButton" Style="{StaticResource PrimaryButton}" Margin="0,0,10,8" IsEnabled="False" ToolTipService.ShowOnDisabled="True" ToolTip="Check a machine first.">
+          <Button x:Name="ConnectButton" Style="{StaticResource PrimaryButton}" Margin="0,0,10,8" IsEnabled="False" ToolTipService.ShowOnDisabled="True" ToolTip="Check a machine first." AutomationProperties.Name="Connect">
             <StackPanel Orientation="Horizontal">
               <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="14" VerticalAlignment="Center" Margin="0,0,8,0" Text="&#xE7F4;"/>
               <TextBlock x:Name="ConnectText" VerticalAlignment="Center" Text="Connect"/>
             </StackPanel>
           </Button>
-          <Button x:Name="AskButton" Style="{StaticResource QuietButton}" Margin="0,0,10,8" IsEnabled="False" ToolTipService.ShowOnDisabled="True" ToolTip="Check a machine first.">
+          <Button x:Name="AskButton" Style="{StaticResource QuietButton}" Margin="0,0,10,8" IsEnabled="False" ToolTipService.ShowOnDisabled="True" ToolTip="Check a machine first." AutomationProperties.Name="Ask to take over">
             <StackPanel Orientation="Horizontal">
               <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="14" VerticalAlignment="Center" Margin="0,0,8,0" Text="&#xE8BD;"/>
               <TextBlock VerticalAlignment="Center" Text="Ask to take over"/>
             </StackPanel>
           </Button>
-          <Button x:Name="WatchButton" Style="{StaticResource QuietButton}" Margin="0,0,10,8" IsEnabled="False" ToolTipService.ShowOnDisabled="True" ToolTip="Check a machine first.">
+          <Button x:Name="WatchButton" Style="{StaticResource QuietButton}" Margin="0,0,10,8" IsEnabled="False" ToolTipService.ShowOnDisabled="True" ToolTip="Check a machine first." AutomationProperties.Name="Watch (view only)">
             <StackPanel Orientation="Horizontal">
               <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="14" VerticalAlignment="Center" Margin="0,0,8,0" Text="&#xE7B3;"/>
               <TextBlock VerticalAlignment="Center" Text="Watch (view only)"/>
             </StackPanel>
           </Button>
-          <Button x:Name="NotifyButton" Style="{StaticResource QuietButton}" Margin="0,0,10,8" IsEnabled="False" ToolTipService.ShowOnDisabled="True" ToolTip="Check a machine first.">
+          <Button x:Name="NotifyButton" Style="{StaticResource QuietButton}" Margin="0,0,10,8" IsEnabled="False" ToolTipService.ShowOnDisabled="True" ToolTip="Check a machine first." AutomationProperties.Name="Tell me when it's free">
             <StackPanel Orientation="Horizontal">
               <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="14" VerticalAlignment="Center" Margin="0,0,8,0" Text="&#xEA8F;"/>
               <TextBlock x:Name="NotifyText" VerticalAlignment="Center" Text="Tell me when it's free"/>
@@ -628,20 +630,21 @@ if ($workArea.Width -gt 0 -and $workArea.Height -gt 0) {
 #region State
 
 $script:Current = $null          # @{ Request; Result } on screen
-$script:LastRequest = $null      # what auto re-check repeats
-$script:NextCheckAt = Get-Date
+$script:NextCheckAt = Get-Date   # when "Re-check every ..." checks the machine on screen
+$script:Watch = $null            # @{ Request; NextAt } while "Tell me when it's free" runs
+$script:Latest = @{}             # request key -> newest result, on screen or not
 $script:CheckTask = $null
+$script:QueuedRequest = $null    # a check asked for while another one runs
 $script:AskTask = $null
 $script:LookupTask = $null
 $script:AskDeadline = Get-Date
 $script:AskUser = ''
-$script:NotifyKey = $null
-$script:AutoBeforeNotify = $false
 $script:Secrets = @{}            # request key -> SecureString, this run only
 $script:ClientMaps = @{}         # request key -> @{ Map; Error; Time }
 $script:Recent = New-Object System.Collections.ArrayList
-$script:UpdatingRecent = $false
+$script:SavedSettings = $null    # the JSON last written, so unchanged settings are not rewritten
 $script:BannerBlock = $null
+$script:BannerContext = $null
 $script:BannerTransient = $false
 $script:Completing = $false
 $script:TrayIcon = $null
@@ -805,11 +808,14 @@ function Write-UiLog {
 }
 
 function Show-Banner {
+    # The banner's button runs $Action with $Context, typically the request it is
+    # about, so it acts on that machine even when another one is on screen by then.
     param(
         [string] $Text,
         [ValidateSet('Info', 'Good', 'Warning', 'Error')] [string] $Kind = 'Info',
         [string] $ActionText = '',
         [scriptblock] $Action = $null,
+        $Context = $null,
         [switch] $Transient
     )
     $tint = $script:StatusFill.Disconnected
@@ -829,10 +835,12 @@ function Show-Banner {
         $script:ui.BannerAction.Content = $ActionText
         $script:ui.BannerAction.Visibility = [System.Windows.Visibility]::Visible
         $script:BannerBlock = $Action
+        $script:BannerContext = $Context
     }
     else {
         $script:ui.BannerAction.Visibility = [System.Windows.Visibility]::Collapsed
         $script:BannerBlock = $null
+        $script:BannerContext = $null
     }
     $script:BannerTransient = [bool] $Transient
     $script:ui.Banner.Visibility = [System.Windows.Visibility]::Visible
@@ -842,7 +850,16 @@ function Show-Banner {
 function Hide-Banner {
     $script:ui.Banner.Visibility = [System.Windows.Visibility]::Collapsed
     $script:BannerBlock = $null
+    $script:BannerContext = $null
     $script:BannerTransient = $false
+}
+
+function Show-Window {
+    # Brings the window to the front, also from the taskbar when minimized.
+    if ($script:Window.WindowState -eq [System.Windows.WindowState]::Minimized) {
+        $script:Window.WindowState = [System.Windows.WindowState]::Normal
+    }
+    $null = $script:Window.Activate()
 }
 
 function Invoke-Safely {
@@ -953,6 +970,18 @@ function Complete-Background {
 
 #region Checking
 
+function Get-FormKey {
+    # Which machine and account the form shows, the way requests are keyed.
+    return ('{0}|{1}' -f ([string] $script:ui.HostBox.Text).Trim(), ([string] $script:ui.UserBox.Text).Trim()).ToLowerInvariant()
+}
+
+function Test-PasswordTyped {
+    # SecurePassword hands out a new copy on every read; this one is disposed.
+    $copy = $script:ui.PassBox.SecurePassword
+    try { return ($copy.Length -gt 0) }
+    finally { $copy.Dispose() }
+}
+
 function Get-FormRequest {
     # Reads the form into a request; $null (with a hint) if something is missing.
     $hostText = ([string] $script:ui.HostBox.Text).Trim()
@@ -962,14 +991,18 @@ function Get-FormRequest {
         return $null
     }
     $account = ([string] $script:ui.UserBox.Text).Trim()
-    $key = ('{0}|{1}' -f $hostText, $account).ToLowerInvariant()
+    $key = Get-FormKey
     $split = Split-HostPort -Address $hostText
     $credential = [System.Management.Automation.PSCredential]::Empty
     $checkingAs = Get-CheckingIdentity -Credential $null
     if ($account) {
         $secure = $script:ui.PassBox.SecurePassword
-        if ($secure.Length -eq 0 -and $script:Secrets.ContainsKey($key)) { $secure = $script:Secrets[$key] }
         if ($secure.Length -eq 0) {
+            $secure.Dispose()
+            $secure = $null
+            if ($script:Secrets.ContainsKey($key)) { $secure = $script:Secrets[$key] }
+        }
+        if ($null -eq $secure) {
             Show-Banner -Text ('Type the password for {0}, or clear Account to check as yourself.' -f $account) -Kind Warning -Transient
             $null = $script:ui.PassBox.Focus()
             return $null
@@ -1028,34 +1061,108 @@ function Set-Busy {
 }
 
 function Start-Check {
-    param($Request)
-    if ($null -ne $script:CheckTask) { return }
-    Set-Busy -On $true -HostName $Request.Host
+    # One check runs at a time. A check asked for while another one runs is not
+    # lost: for the same machine and password it takes that check's result,
+    # otherwise it starts as soon as that check is done. -Background checks
+    # ("Re-check every ..." and watching) wait for the next tick instead, and
+    # show their result only when nothing else is on screen by then.
+    param($Request, [switch] $Background)
+    $running = $script:CheckTask
+    if ($null -ne $running) {
+        if ($Background) { return }
+        $sameSecret = [object]::ReferenceEquals($running.Context.Request.Credential.Password, $Request.Credential.Password)
+        if ($running.Context.Request.Key -eq $Request.Key -and $sameSecret) {
+            if (-not $running.Context.Shown) {
+                $running.Context.Shown = $true
+                Set-Busy -On $true -HostName $Request.Host
+            }
+        }
+        else {
+            $script:QueuedRequest = $Request
+        }
+        Update-Footer
+        return
+    }
+    $shown = (-not $Background) -or $null -eq $script:Current -or $script:Current.Request.Key -eq $Request.Key
+    if ($shown) { Set-Busy -On $true -HostName $Request.Host }
+    $context = @{ Request = $Request; Shown = $shown }
     $arguments = @{ JobTarget = $Request.Target; JobSettings = $Request.Settings }
-    $script:CheckTask = Start-Background -Name ('Checking {0} as {1}' -f $Request.Host, $Request.Settings.CheckingAs) -Script $script:CheckJobScript -Arguments $arguments -Context $Request -OnDone {
+    $script:CheckTask = Start-Background -Name ('Checking {0} as {1}' -f $Request.Host, $Request.Settings.CheckingAs) -Script $script:CheckJobScript -Arguments $arguments -Context $context -OnDone {
         param($Output, $Failure, $Context)
-        Complete-Check -Output $Output -Failure $Failure -Request $Context
+        Complete-Check -Output $Output -Failure $Failure -Context $Context
     }
     Update-Footer
 }
 
 function Complete-Check {
-    param($Output, $Failure, $Request)
+    param($Output, $Failure, $Context)
+    $request = $Context.Request
     $script:CheckTask = $null
-    Set-Busy -On $false
     $result = $null
     if ($null -ne $Output -and $Output.Ok) { $result = $Output.Value }
     if ($null -eq $result) {
         $reason = [pscustomobject]@{ Reason = 'no result'; Text = 'The background check ended without a result; the log below has the details.'; Code = $null }
-        if ($null -ne $Failure) { $reason = Get-FailureText -ErrorRecord $Failure -Settings $Request.Settings }
-        $result = New-UnknownResult -Target $Request.Target -Reason $reason.Reason -Text $reason.Text -Code $reason.Code
+        if ($null -ne $Failure) { $reason = Get-FailureText -ErrorRecord $Failure -Settings $request.Settings }
+        $result = New-UnknownResult -Target $request.Target -Reason $reason.Reason -Text $reason.Text -Code $reason.Code
     }
-    $script:Current = @{ Request = $Request; Result = $result }
-    $script:LastRequest = $Request
-    $script:NextCheckAt = (Get-Date).AddSeconds($script:Options.Refresh)
-    Show-Result
-    Update-Recent -Request $Request -Result $result
-    Test-NotifyCondition -Request $Request -Result $result
+    $script:Latest[$request.Key] = $result
+    $rejected = Test-SignInRejected -Code $result.ErrorCode
+    $watchStopped = $false
+    if ($null -ne $script:Watch -and $script:Watch.Request.Key -eq $request.Key) {
+        if ($rejected) {
+            $script:Watch = $null
+            $watchStopped = $true
+        }
+        else {
+            $script:Watch.NextAt = (Get-Date).AddSeconds($script:Options.Refresh)
+        }
+    }
+    if ($rejected) { Remove-RejectedSecret -Request $request -ClearForm ([bool] $Context.Shown) }
+    if ($Context.Shown) {
+        Set-Busy -On $false
+        $script:Current = @{ Request = $request; Result = $result }
+        $script:NextCheckAt = (Get-Date).AddSeconds($script:Options.Refresh)
+        Show-Result
+    }
+    Update-Recent -Request $request -Result $result
+    if ($rejected) {
+        $text = '{0} rejected the sign-in as {1}. Trying it again and again could lock the account out, so the dashboard does not check {0} on its own until you check it again.' -f $request.Host, $request.Settings.CheckingAs
+        if ($request.Account) { $text += ' Type the password again first: the one you typed is forgotten.' }
+        if ($watchStopped) { $text += ' Watching it has stopped.' }
+        Show-Banner -Text $text -Kind Warning
+    }
+    else {
+        Test-WatchCondition -Request $request -Result $result
+    }
+    $next = $script:QueuedRequest
+    $script:QueuedRequest = $null
+    if ($null -ne $next) { Start-Check -Request $next }
+    Update-Actions
+    Update-Footer
+}
+
+function Remove-RejectedSecret {
+    # Forgets a password the machine rejected, so that nothing tries it again: the
+    # remembered one if it is the same, and with -ClearForm the one in the form.
+    param($Request, [bool] $ClearForm = $false)
+    if (-not $Request.Account) { return }
+    $rejected = $Request.Credential.Password
+    if ($script:Secrets.ContainsKey($Request.Key) -and [object]::ReferenceEquals($script:Secrets[$Request.Key], $rejected)) {
+        $script:Secrets.Remove($Request.Key)
+    }
+    if ($ClearForm -and (Get-FormKey) -eq $Request.Key) { $script:ui.PassBox.Clear() }
+    Update-PassHint
+}
+
+function Test-AutoRecheck {
+    # Whether "Re-check every ..." applies to the machine on screen. Not after it
+    # rejected the sign-in: more tries could lock the account out.
+    return ([bool] $script:ui.AutoBox.IsChecked -and $null -ne $script:Current -and -not (Test-SignInRejected -Code $script:Current.Result.ErrorCode))
+}
+
+function Get-SecondsUntil {
+    param([DateTime] $Time)
+    return [int] [Math]::Max(0, [Math]::Ceiling(($Time - (Get-Date)).TotalSeconds))
 }
 
 #endregion
@@ -1205,68 +1312,95 @@ function Set-Fact {
     if ($Sub) { $subBlock.ToolTip = $Sub } else { $subBlock.ToolTip = $null }
 }
 
-function Show-Facts {
-    param($Result, $Request, $Lookup)
+function New-Fact {
+    param([string] $Label, [string] $Value, [string] $Sub = '')
+    return @{ Label = $Label; Value = $Value; Sub = $Sub }
+}
+
+function Get-FactList {
+    # The four facts under the sign, each @{ Label; Value; Sub }.
+    param($Result, $Lookup)
     $s = $Result.Session
     if ($null -eq $s) {
         $people = @($Result.Sessions).Count
         $peopleSub = 'nobody else either'
         if ($people -gt 0) { $peopleSub = 'other accounts, listed below' }
-        Set-Fact -Index 1 -Label 'People signed in' -Value ([string] $people) -Sub $peopleSub
+        # The machine's own screen: someone signed in there, or the console's
+        # entry among the sessions with nobody in them.
+        $atConsole = @($Result.Sessions | Where-Object { $_.Protocol -eq 'Console' }) | Select-Object -First 1
         $console = @($Result.SystemSessions | Where-Object { $_.Name -like 'Console*' }) | Select-Object -First 1
         $consoleValue = 'Not in use'
         $consoleSub = ''
-        if ($null -ne $console) {
+        if ($null -ne $atConsole) {
+            $consoleValue = Get-StatusWord ([string] $atConsole.Status)
+            $consoleSub = '{0}, session {1}' -f (Get-UserLeaf -Name $atConsole.User), $atConsole.SessionId
+        }
+        elseif ($null -ne $console) {
             if ($console.State -eq 'Connected') { $consoleValue = 'Sign-in screen' }
             $consoleSub = 'session {0}' -f $console.SessionId
         }
-        Set-Fact -Index 2 -Label 'Its own screen' -Value $consoleValue -Sub $consoleSub
-        Set-Fact -Index 3 -Label 'Checked as' -Value (Get-UserLeaf -Name ([string] $Result.CheckedAs)) -Sub ([string] $Result.CheckedAs)
         $took = ''
         if ($null -ne $Result.DurationMs) { $took = '{0} ms' -f $Result.DurationMs }
-        Set-Fact -Index 4 -Label 'Check took' -Value $took -Sub ('at {0:HH:mm:ss}' -f $Result.CheckedAt)
-        return
+        return @(
+            (New-Fact -Label 'People signed in' -Value ([string] $people) -Sub $peopleSub),
+            (New-Fact -Label 'Its own screen' -Value $consoleValue -Sub $consoleSub),
+            (New-Fact -Label 'Checked as' -Value (Get-UserLeaf -Name ([string] $Result.CheckedAs)) -Sub ([string] $Result.CheckedAs)),
+            (New-Fact -Label 'Check took' -Value $took -Sub ('at {0:HH:mm:ss}' -f $Result.CheckedAt))
+        )
     }
+    $first = New-Fact -Label 'State' -Value ([string] $s.State)
     switch ([string] $s.Status) {
         'Disconnected' {
             $since = Format-Span $s.DisconnectedFor
             $value = 'Yes'
             if ($since) { $value = '{0} ago' -f $since }
-            Set-Fact -Index 1 -Label 'Disconnected' -Value $value -Sub (Format-When $s.DisconnectTime)
+            $first = New-Fact -Label 'Disconnected' -Value $value -Sub (Format-When $s.DisconnectTime)
         }
         'Locked' {
             $sub = ''
             if ($null -ne $s.IdleTime) { $sub = 'no input for {0}' -f (Format-Span $s.IdleTime) }
-            Set-Fact -Index 1 -Label 'Screen' -Value 'Locked' -Sub $sub
+            $first = New-Fact -Label 'Screen' -Value 'Locked' -Sub $sub
         }
-        'Idle' { Set-Fact -Index 1 -Label 'No input for' -Value (Format-Span $s.IdleTime) -Sub 'keyboard and mouse untouched' }
+        'Idle' { $first = New-Fact -Label 'No input for' -Value (Format-Span $s.IdleTime) -Sub 'keyboard and mouse untouched' }
         'InUse' {
             if ($null -eq $s.IdleTime) {
                 $sub = ''
                 if ($s.Protocol -eq 'Console') { $sub = 'not for the console' }
                 elseif ($s.IdleNote -ne 'idle time not reported') { $sub = [string] $s.IdleNote }
-                Set-Fact -Index 1 -Label 'Last input' -Value 'Not reported' -Sub $sub
+                $first = New-Fact -Label 'Last input' -Value 'Not reported' -Sub $sub
             }
-            elseif ($s.IdleTime.TotalSeconds -lt 60) { Set-Fact -Index 1 -Label 'Last input' -Value 'Just now' -Sub 'keyboard or mouse' }
-            else { Set-Fact -Index 1 -Label 'Last input' -Value ('{0} ago' -f (Format-Span $s.IdleTime)) -Sub 'keyboard or mouse' }
+            elseif ($s.IdleTime.TotalSeconds -lt 60) { $first = New-Fact -Label 'Last input' -Value 'Just now' -Sub 'keyboard or mouse' }
+            else { $first = New-Fact -Label 'Last input' -Value ('{0} ago' -f (Format-Span $s.IdleTime)) -Sub 'keyboard or mouse' }
         }
-        'Busy' { Set-Fact -Index 1 -Label 'Running' -Value (@($s.BusyProcesses) -join ', ') -Sub (Get-StateDetail -Session $s) }
-        default { Set-Fact -Index 1 -Label 'State' -Value ([string] $s.State) -Sub '' }
+        'Busy' { $first = New-Fact -Label 'Running' -Value (@($s.BusyProcesses) -join ', ') -Sub (Get-StateDetail -Session $s) }
     }
     $signedIn = 'Not reported'
     if ($null -ne $s.SignedInFor) { $signedIn = '{0} ago' -f (Format-Span $s.SignedInFor) }
-    Set-Fact -Index 2 -Label 'Signed in' -Value $signedIn -Sub (Format-When $s.LogonTime)
     $client = Get-ClientText -Session $s -Lookup $Lookup
     $label = 'Connected from'
     if ($s.Status -eq 'Disconnected') { $label = 'Last connected from' }
-    Set-Fact -Index 3 -Label $label -Value $client.Main -Sub $client.Sub
     $how = ([string] $s.State).ToLower()
     switch ([string] $s.Protocol) {
         'RDP'     { $how = 'Remote Desktop' }
         'Console' { $how = 'physical console' }
         'ICA'     { $how = 'Citrix' }
     }
-    Set-Fact -Index 4 -Label 'Session' -Value ([string] $s.SessionId) -Sub $how
+    return @(
+        $first,
+        (New-Fact -Label 'Signed in' -Value $signedIn -Sub (Format-When $s.LogonTime)),
+        (New-Fact -Label $label -Value $client.Main -Sub $client.Sub),
+        (New-Fact -Label 'Session' -Value ([string] $s.SessionId) -Sub $how)
+    )
+}
+
+function Show-Facts {
+    param($Result, $Lookup)
+    $facts = @(Get-FactList -Result $Result -Lookup $Lookup)
+    for ($i = 0; $i -lt 4; $i++) {
+        $fact = New-Fact -Label '' -Value ''
+        if ($i -lt $facts.Count) { $fact = $facts[$i] }
+        Set-Fact -Index ($i + 1) -Label $fact.Label -Value $fact.Value -Sub $fact.Sub
+    }
 }
 
 function Show-Result {
@@ -1306,7 +1440,7 @@ function Show-Result {
     else {
         $script:ui.ErrorBox.Visibility = [System.Windows.Visibility]::Collapsed
         $script:ui.Facts.Visibility = [System.Windows.Visibility]::Visible
-        Show-Facts -Result $result -Request $request -Lookup $lookup
+        Show-Facts -Result $result -Lookup $lookup
     }
     # The sign's lower corner is square when the facts strip runs under it.
     $lower = 11
@@ -1331,6 +1465,9 @@ function Update-Actions {
     }
     $risky = @('InUse', 'Idle', 'Locked', 'Busy', 'Connecting') -contains $status
     $active = ($null -ne $s -and $s.State -eq 'Active')
+    $rejected = $hasResult -and (Test-SignInRejected -Code $current.Result.ErrorCode)
+    $noSession = 'Only possible while someone is connected to the session.'
+    if (-not $hasResult) { $noSession = 'Check a machine first.' }
 
     $script:ui.ConnectButton.IsEnabled = $hasResult
     if ($risky) {
@@ -1349,27 +1486,32 @@ function Update-Actions {
         if ($hasResult) { $script:ui.ConnectButton.ToolTip = 'Opens Remote Desktop with this machine and account filled in.' }
         else { $script:ui.ConnectButton.ToolTip = 'Check a machine first.' }
     }
+    [System.Windows.Automation.AutomationProperties]::SetName($script:ui.ConnectButton, $script:ui.ConnectText.Text)
 
     $script:ui.AskButton.IsEnabled = ($active -and $null -eq $script:AskTask)
     if ($null -ne $script:AskTask) { $script:ui.AskButton.ToolTip = 'Waiting for the answer to your request.' }
     elseif ($active) { $script:ui.AskButton.ToolTip = 'Shows a Yes/No box in their session. If they click Yes, Remote Desktop opens for you.' }
-    else { $script:ui.AskButton.ToolTip = 'Only possible while someone is connected to the session.' }
+    else { $script:ui.AskButton.ToolTip = $noSession }
 
     $script:ui.WatchButton.IsEnabled = $active
     if ($active) { $script:ui.WatchButton.ToolTip = 'Opens a view-only copy of their screen. Needs administrator rights there; by default they are asked first.' }
-    else { $script:ui.WatchButton.ToolTip = 'Only possible while someone is connected to the session.' }
+    else { $script:ui.WatchButton.ToolTip = $noSession }
 
-    $waitable = $hasResult -and ($status -ne 'Free') -and ($status -ne 'Disconnected')
-    $script:ui.NotifyButton.IsEnabled = ($waitable -or $null -ne $script:NotifyKey)
-    if ($null -ne $script:NotifyKey) {
+    # Watching runs on its own schedule, so it can be stopped from any machine.
+    $waitable = $hasResult -and -not $rejected -and ($status -ne 'Free') -and ($status -ne 'Disconnected')
+    $script:ui.NotifyButton.IsEnabled = ($waitable -or $null -ne $script:Watch)
+    if ($null -ne $script:Watch) {
         $script:ui.NotifyText.Text = 'Stop watching'
-        $script:ui.NotifyButton.ToolTip = 'Stops the automatic checks for this machine.'
+        $script:ui.NotifyButton.ToolTip = ('Stops checking {0} every {1} s.' -f $script:Watch.Request.Host, $script:Options.Refresh)
     }
     else {
         $script:ui.NotifyText.Text = "Tell me when it's free"
         if ($waitable) { $script:ui.NotifyButton.ToolTip = ('Checks every {0} s and notifies you when the session is free or disconnected. Keep this window open.' -f $script:Options.Refresh) }
-        else { $script:ui.NotifyButton.ToolTip = 'The machine is already free.' }
+        elseif ($rejected) { $script:ui.NotifyButton.ToolTip = 'Not while the machine rejects the sign-in: checking again and again could lock the account out.' }
+        elseif ($hasResult) { $script:ui.NotifyButton.ToolTip = 'The machine is already free.' }
+        else { $script:ui.NotifyButton.ToolTip = 'Check a machine first.' }
     }
+    [System.Windows.Automation.AutomationProperties]::SetName($script:ui.NotifyButton, $script:ui.NotifyText.Text)
 
     $needsLookup = $false
     if ($hasResult -and $status -ne 'Unknown') {
@@ -1518,14 +1660,30 @@ function Update-Footer {
     else {
         $parts += 'Not checked yet.'
     }
+    $checking = $null
     if ($null -ne $script:CheckTask) {
-        $parts += ('Checking now{0}' -f $script:Ellipsis)
+        $checking = $script:CheckTask.Context.Request
+        $parts += ('Checking {0} now{1}' -f $checking.Host, $script:Ellipsis)
     }
-    elseif ($script:ui.AutoBox.IsChecked -and $null -ne $script:LastRequest) {
-        $left = [int] [Math]::Max(0, [Math]::Ceiling(($script:NextCheckAt - (Get-Date)).TotalSeconds))
-        $parts += ('Next check of {0} in {1} s.' -f $script:LastRequest.Host, $left)
+    if ($null -ne $script:QueuedRequest) { $parts += ('{0} is next.' -f $script:QueuedRequest.Host) }
+    # The next automatic checks: the watched machine, and the one on screen.
+    $auto = Test-AutoRecheck
+    if ($null -ne $script:Watch) {
+        $watched = $script:Watch.Request
+        if ($null -eq $checking -or $checking.Key -ne $watched.Key) {
+            $at = $script:Watch.NextAt
+            if ($auto -and $script:Current.Request.Key -eq $watched.Key -and $script:NextCheckAt -lt $at) { $at = $script:NextCheckAt }
+            $parts += ('Next check of {0} in {1} s.' -f $watched.Host, (Get-SecondsUntil -Time $at))
+        }
+        $parts += ('You get a notification when {0} is free.' -f $watched.Host)
     }
-    if ($null -ne $script:NotifyKey) { $parts += 'You will get a notification when it is free.' }
+    if ($auto) {
+        $shown = $script:Current.Request
+        $isWatched = ($null -ne $script:Watch -and $script:Watch.Request.Key -eq $shown.Key)
+        if (-not $isWatched -and ($null -eq $checking -or $checking.Key -ne $shown.Key)) {
+            $parts += ('Next check of {0} in {1} s.' -f $shown.Host, (Get-SecondsUntil -Time $script:NextCheckAt))
+        }
+    }
     $script:ui.FooterText.Text = $parts -join ' '
 }
 
@@ -1546,35 +1704,36 @@ function Update-Recent {
 }
 
 function Show-RecentList {
-    $script:UpdatingRecent = $true
-    try {
-        $list = $script:ui.RecentList
-        $list.Items.Clear()
-        foreach ($entry in $script:Recent) {
-            $grid = New-Object System.Windows.Controls.Grid
-            $first = New-Object System.Windows.Controls.ColumnDefinition
-            $first.Width = New-Object System.Windows.GridLength -ArgumentList 18.0, ([System.Windows.GridUnitType]::Pixel)
-            $grid.ColumnDefinitions.Add($first)
-            $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
-            Add-Cell -Grid $grid -Column 0 -Element (New-Dot -Status ([string] $entry.Status))
-            $who = 'as yourself'
-            if ($entry.Account) { $who = 'as {0}' -f $entry.Account }
-            $state = 'not checked yet'
-            if ($entry.Status -ne 'None' -and $null -ne $entry.Time) { $state = '{0} at {1:HH:mm}' -f (Get-StatusWord $entry.Status).ToLower(), $entry.Time }
-            $texts = New-Stack @((New-Text -Text $entry.Host -Size 13 -SemiBold), (New-Text -Text ('{0}, {1}' -f $who, $state) -Size 12 -Brush 'Muted'))
-            Add-Cell -Grid $grid -Column 1 -Element $texts
-            $item = New-Object System.Windows.Controls.ListBoxItem
-            $item.Style = $script:Window.FindResource('RecentItem')
-            $item.Content = $grid
-            $item.Tag = $entry
-            $null = $list.Items.Add($item)
-        }
-        if ($script:Recent.Count -gt 0) { $script:ui.RecentEmpty.Visibility = [System.Windows.Visibility]::Collapsed }
-        else { $script:ui.RecentEmpty.Visibility = [System.Windows.Visibility]::Visible }
+    # A click on an entry, or Enter or Space on the selected one (wired on the
+    # list), checks it again; the arrow keys only move the selection.
+    $list = $script:ui.RecentList
+    $list.Items.Clear()
+    foreach ($entry in $script:Recent) {
+        $grid = New-Object System.Windows.Controls.Grid
+        $first = New-Object System.Windows.Controls.ColumnDefinition
+        $first.Width = New-Object System.Windows.GridLength -ArgumentList 18.0, ([System.Windows.GridUnitType]::Pixel)
+        $grid.ColumnDefinitions.Add($first)
+        $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+        Add-Cell -Grid $grid -Column 0 -Element (New-Dot -Status ([string] $entry.Status))
+        $who = 'as yourself'
+        if ($entry.Account) { $who = 'as {0}' -f $entry.Account }
+        $state = 'not checked yet'
+        if ($entry.Status -ne 'None' -and $null -ne $entry.Time) { $state = '{0} at {1:HH:mm}' -f (Get-StatusWord $entry.Status).ToLower(), $entry.Time }
+        $texts = New-Stack @((New-Text -Text $entry.Host -Size 13 -SemiBold), (New-Text -Text ('{0}, {1}' -f $who, $state) -Size 12 -Brush 'Muted'))
+        Add-Cell -Grid $grid -Column 1 -Element $texts
+        $item = New-Object System.Windows.Controls.ListBoxItem
+        $item.Style = $script:Window.FindResource('RecentItem')
+        $item.Content = $grid
+        $item.Tag = $entry
+        [System.Windows.Automation.AutomationProperties]::SetName($item, ('{0}, {1}, {2}' -f $entry.Host, $who, $state))
+        $item.Add_PreviewMouseLeftButtonUp({
+            $clicked = $this.Tag
+            Invoke-Safely { Select-RecentEntry -Entry $clicked }
+        })
+        $null = $list.Items.Add($item)
     }
-    finally {
-        $script:UpdatingRecent = $false
-    }
+    if ($script:Recent.Count -gt 0) { $script:ui.RecentEmpty.Visibility = [System.Windows.Visibility]::Collapsed }
+    else { $script:ui.RecentEmpty.Visibility = [System.Windows.Visibility]::Visible }
 }
 
 function Select-RecentEntry {
@@ -1592,8 +1751,7 @@ function Select-RecentEntry {
 }
 
 function Update-PassHint {
-    $key = ('{0}|{1}' -f ([string] $script:ui.HostBox.Text).Trim(), ([string] $script:ui.UserBox.Text).Trim()).ToLowerInvariant()
-    if ($script:ui.PassBox.SecurePassword.Length -eq 0 -and $script:Secrets.ContainsKey($key)) {
+    if (-not (Test-PasswordTyped) -and $script:Secrets.ContainsKey((Get-FormKey))) {
         $script:ui.PassHint.Text = 'The password you typed earlier for this account is used.'
     }
     else {
@@ -1619,15 +1777,16 @@ function Read-DashboardSettings {
 }
 
 function Save-DashboardSettings {
+    # Writes only when something changed, not after every automatic re-check.
     try {
+        $recent = @(foreach ($entry in $script:Recent) { [ordered]@{ host = $entry.Host; account = $entry.Account } })
+        $data = [ordered]@{ recent = $recent; autoRefresh = [bool] $script:ui.AutoBox.IsChecked }
+        $json = ConvertTo-Json -InputObject $data -Depth 4
+        if ($json -ceq $script:SavedSettings) { return }
         $folder = Split-Path -Parent $script:SettingsPath
         if (-not (Test-Path -LiteralPath $folder)) { $null = New-Item -ItemType Directory -Path $folder -Force }
-        $recent = @(foreach ($entry in $script:Recent) { [ordered]@{ host = $entry.Host; account = $entry.Account } })
-        $autoRefresh = $false
-        if ($script:ui.AutoBox.IsChecked) { $autoRefresh = $true }
-        if ($null -ne $script:NotifyKey) { $autoRefresh = $script:AutoBeforeNotify }
-        $data = [ordered]@{ recent = $recent; autoRefresh = $autoRefresh }
-        Set-Content -LiteralPath $script:SettingsPath -Value (ConvertTo-Json -InputObject $data -Depth 4) -Encoding UTF8
+        Set-Content -LiteralPath $script:SettingsPath -Value $json -Encoding UTF8
+        $script:SavedSettings = $json
     }
     catch {
         Write-UiLog -Text ("Couldn't save {0}: {1}" -f $script:SettingsPath, $_.Exception.Message) -Kind Warning
@@ -1650,11 +1809,12 @@ function Start-RdpSession {
         $template = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Default.rdp'
         if (Test-Path -LiteralPath $template) {
             foreach ($line in @(Get-Content -LiteralPath $template)) {
-                if (-not $line -or $line -match '^\s*(full address|alternate full address|username)\s*:') { continue }
+                # A domain line would turn a bare account name into DOMAIN\name.
+                if (-not $line -or $line -match '^\s*(full address|alternate full address|username|domain)\s*:') { continue }
                 $lines.Add($line)
             }
         }
-        $lines.Add(('full address:s:{0}' -f $Request.Host))
+        $lines.Add(('full address:s:{0}' -f (Format-MstscHost -Address $Request.Host)))
         if ($Request.Account) { $lines.Add(('username:s:{0}' -f $Request.Account)) }
         Set-Content -LiteralPath $file -Value $lines -Encoding Unicode
         Write-UiLog -Text ('Starting Remote Desktop: mstsc "{0}"' -f $file)
@@ -1666,13 +1826,23 @@ function Start-RdpSession {
 }
 
 function Invoke-Connect {
-    param([switch] $SkipConfirm)
-    $current = $script:Current
-    if ($null -eq $current) { return }
-    $status = [string] $current.Result.Status
-    $s = $current.Result.Session
+    # Opens Remote Desktop for the machine on screen, or for -Request (from a
+    # banner about another one). Asks first when the newest check of that
+    # machine says someone would be cut off.
+    param($Request = $null)
+    if ($null -eq $Request) {
+        if ($null -eq $script:Current) { return }
+        $Request = $script:Current.Request
+    }
+    $status = 'Unknown'
+    $s = $null
+    $latest = $script:Latest[$Request.Key]
+    if ($null -ne $latest) {
+        $status = [string] $latest.Status
+        $s = $latest.Session
+    }
     $risky = @('InUse', 'Idle', 'Locked', 'Busy', 'Connecting') -contains $status
-    if ($risky -and -not $SkipConfirm) {
+    if ($risky) {
         $who = 'Someone'
         if ($null -ne $s) { $who = $s.User }
         $what = 'is connected'
@@ -1683,17 +1853,17 @@ function Invoke-Connect {
             'Busy'       { $what = 'has automation running' }
             'Connecting' { $what = 'is signing in right now' }
         }
-        $message = "{0} {1} on {2}.`n`nConnecting now disconnects them without warning; their apps keep running.`n`nConnect anyway?" -f $who, $what, $current.Request.Host
+        $message = "{0} {1} on {2}.`n`nConnecting now disconnects them without warning; their apps keep running.`n`nConnect anyway?" -f $who, $what, $Request.Host
         $answer = [System.Windows.MessageBox]::Show($script:Window, $message, 'Connect anyway?', [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning, [System.Windows.MessageBoxResult]::No)
         if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
     }
-    Start-RdpSession -Request $current.Request
+    Start-RdpSession -Request $Request
 }
 
 function Invoke-Watch {
     $current = $script:Current
     if ($null -eq $current -or $null -eq $current.Result.Session) { return }
-    $arguments = '/v:{0} /shadow:{1}' -f $current.Request.QueryHost, $current.Result.Session.SessionId
+    $arguments = '/v:{0} /shadow:{1}' -f (Format-MstscHost -Address $current.Request.QueryHost), $current.Result.Session.SessionId
     if ($current.Request.Account) { $arguments += ' /prompt' }
     Write-UiLog -Text ('Starting a view-only window: mstsc {0}' -f $arguments)
     try {
@@ -1746,11 +1916,17 @@ function Complete-Ask {
                 return
             }
             7 {
-                Show-Banner -Text ('{0} wants to keep working.' -f $Context.User) -Kind Warning -ActionText "Tell me when it's free" -Action { Switch-Notify }
+                Show-Banner -Text ('{0} wants to keep working.' -f $Context.User) -Kind Warning -ActionText "Tell me when it's free" -Context $Context.Request -Action {
+                    param($Request)
+                    Start-Watch -Request $Request
+                }
                 return
             }
             32000 {
-                Show-Banner -Text ('No answer from {0} within {1} s.' -f $Context.User, $script:Options.AskTimeout) -Kind Warning -ActionText ('Connect anyway' + $script:Ellipsis) -Action { Invoke-Connect }
+                Show-Banner -Text ('No answer from {0} within {1} s.' -f $Context.User, $script:Options.AskTimeout) -Kind Warning -ActionText ('Connect anyway' + $script:Ellipsis) -Context $Context.Request -Action {
+                    param($Request)
+                    Invoke-Connect -Request $Request
+                }
                 return
             }
         }
@@ -1762,37 +1938,44 @@ function Complete-Ask {
     Show-Banner -Text ("Couldn't ask: {0}" -f $text) -Kind Error
 }
 
-function Switch-Notify {
-    $current = $script:Current
-    if ($null -ne $script:NotifyKey) {
-        $script:NotifyKey = $null
-        $script:ui.AutoBox.IsChecked = $script:AutoBeforeNotify
-        Show-Banner -Text 'Stopped watching for a free session.' -Kind Info -Transient
-        Update-Actions
-        Update-Footer
-        return
-    }
-    if ($null -eq $current) { return }
-    $script:NotifyKey = $current.Request.Key
-    $script:AutoBeforeNotify = [bool] $script:ui.AutoBox.IsChecked
-    $script:ui.AutoBox.IsChecked = $true
-    $script:LastRequest = $current.Request
-    $script:NextCheckAt = (Get-Date).AddSeconds($script:Options.Refresh)
-    Show-Banner -Text ('Watching {0}: checking every {1} s. You get a notification when it is free; keep this window open.' -f $current.Request.Host, $script:Options.Refresh) -Kind Info -ActionText 'Stop watching' -Action { Switch-Notify }
+function Start-Watch {
+    # "Tell me when it's free": checks the machine every RefreshSeconds on its own
+    # schedule, also while other machines are checked, until it is free.
+    param($Request)
+    if ($null -eq $Request) { return }
+    $script:Watch = @{ Request = $Request; NextAt = (Get-Date).AddSeconds($script:Options.Refresh) }
+    Show-Banner -Text ('Watching {0}: checking every {1} s. You get a notification when it is free; keep this window open.' -f $Request.Host, $script:Options.Refresh) -Kind Info -ActionText 'Stop watching' -Action { Stop-Watch }
     Update-Actions
     Update-Footer
 }
 
-function Test-NotifyCondition {
+function Stop-Watch {
+    if ($null -eq $script:Watch) { return }
+    $watched = $script:Watch.Request.Host
+    $script:Watch = $null
+    Show-Banner -Text ('Stopped watching {0}.' -f $watched) -Kind Info -Transient
+    Update-Actions
+    Update-Footer
+}
+
+function Switch-Watch {
+    if ($null -ne $script:Watch) { Stop-Watch }
+    elseif ($null -ne $script:Current) { Start-Watch -Request $script:Current.Request }
+}
+
+function Test-WatchCondition {
+    # Ends the watch with a notification once the watched machine is free.
     param($Request, $Result)
-    if ($null -eq $script:NotifyKey -or $script:NotifyKey -ne $Request.Key) { return }
+    if ($null -eq $script:Watch -or $script:Watch.Request.Key -ne $Request.Key) { return }
     $status = [string] $Result.Status
     if ($status -ne 'Free' -and $status -ne 'Disconnected') { return }
-    $script:NotifyKey = $null
-    $script:ui.AutoBox.IsChecked = $script:AutoBeforeNotify
+    $script:Watch = $null
     $text = '{0} is free.' -f $Request.Host
     if ($status -eq 'Disconnected') { $text = '{0} is free: the session is disconnected.' -f $Request.Host }
-    Show-Banner -Text ('{0} Connect now?' -f $text) -Kind Good -ActionText 'Connect' -Action { Invoke-Connect -SkipConfirm }
+    Show-Banner -Text ('{0} Connect now?' -f $text) -Kind Good -ActionText 'Connect' -Context $Request -Action {
+        param($Watched)
+        Invoke-Connect -Request $Watched
+    }
     Send-Notification -Title 'Shared Remote Desktop' -Text $text
     Update-Actions
     Update-Footer
@@ -1814,8 +1997,8 @@ function Send-Notification {
             if ($null -ne $script:AppIcon) { $script:TrayIcon.Icon = $script:AppIcon }
             else { $script:TrayIcon.Icon = [System.Drawing.SystemIcons]::Information }
             $script:TrayIcon.Text = 'Shared Remote Desktop'
-            $script:TrayIcon.Add_BalloonTipClicked({ Invoke-Safely { $null = $script:Window.Activate() } })
-            $script:TrayIcon.Add_MouseClick({ Invoke-Safely { $null = $script:Window.Activate() } })
+            $script:TrayIcon.Add_BalloonTipClicked({ Invoke-Safely { Show-Window } })
+            $script:TrayIcon.Add_MouseClick({ Invoke-Safely { Show-Window } })
         }
         $script:TrayIcon.Visible = $true
         $script:TrayIcon.ShowBalloonTip(10000, $Title, $Text, [System.Windows.Forms.ToolTipIcon]::Info)
@@ -1891,14 +2074,15 @@ $script:ui.CheckButton.Add_Click({ Invoke-Safely { Invoke-CheckFromForm } })
 $script:ui.ConnectButton.Add_Click({ Invoke-Safely { Invoke-Connect } })
 $script:ui.AskButton.Add_Click({ Invoke-Safely { Invoke-Ask } })
 $script:ui.WatchButton.Add_Click({ Invoke-Safely { Invoke-Watch } })
-$script:ui.NotifyButton.Add_Click({ Invoke-Safely { Switch-Notify } })
+$script:ui.NotifyButton.Add_Click({ Invoke-Safely { Switch-Watch } })
 $script:ui.LookupButton.Add_Click({ Invoke-Safely { Invoke-Lookup } })
 $script:ui.BannerClose.Add_Click({ Invoke-Safely { Hide-Banner } })
 $script:ui.BannerAction.Add_Click({
     Invoke-Safely {
         $block = $script:BannerBlock
+        $context = $script:BannerContext
         Hide-Banner
-        if ($null -ne $block) { & $block }
+        if ($null -ne $block) { & $block $context }
     }
 })
 $script:ui.AutoBox.Add_Click({
@@ -1919,17 +2103,18 @@ $script:ui.FactsGrid.Add_SizeChanged({
 $script:ui.HostBox.Add_TextChanged({ Invoke-Safely { Update-PassHint } })
 $script:ui.UserBox.Add_TextChanged({ Invoke-Safely { Update-PassHint } })
 $script:ui.PassBox.Add_PasswordChanged({ Invoke-Safely { Update-PassHint } })
-$script:ui.RecentList.Add_SelectionChanged({
-    Invoke-Safely {
-        if ($script:UpdatingRecent) { return }
-        $item = $script:ui.RecentList.SelectedItem
-        if ($null -eq $item) { return }
-        # Clear the selection so the same machine can be clicked again.
-        $script:UpdatingRecent = $true
-        try { $script:ui.RecentList.SelectedIndex = -1 }
-        finally { $script:UpdatingRecent = $false }
-        Select-RecentEntry -Entry $item.Tag
-    }
+# Clicks on recent machines are wired per entry in Show-RecentList. Enter or
+# Space checks the entry that has the keyboard focus; it is marked handled so
+# that Enter does not also press Check now.
+$script:ui.RecentList.Add_PreviewKeyDown({
+    $key = $_.Key
+    if ($key -ne [System.Windows.Input.Key]::Enter -and $key -ne [System.Windows.Input.Key]::Space) { return }
+    $item = $_.OriginalSource
+    if ($item -isnot [System.Windows.Controls.ListBoxItem]) { $item = $script:ui.RecentList.SelectedItem }
+    if ($null -eq $item -or $null -eq $item.Tag) { return }
+    $_.Handled = $true
+    $chosen = $item.Tag
+    Invoke-Safely { Select-RecentEntry -Entry $chosen }
 })
 $script:ui.LogToggle.Add_Click({
     Invoke-Safely {
@@ -2012,8 +2197,16 @@ $script:Clock = New-Object System.Windows.Threading.DispatcherTimer
 $script:Clock.Interval = [TimeSpan]::FromSeconds(1)
 $script:Clock.Add_Tick({
     Invoke-Safely {
-        if ($script:ui.AutoBox.IsChecked -and $null -ne $script:LastRequest -and $null -eq $script:CheckTask -and (Get-Date) -ge $script:NextCheckAt) {
-            Start-Check -Request $script:LastRequest
+        # Automatic checks: the watched machine first, then "Re-check every ..."
+        # of the machine on screen. One check at a time; the other waits a tick.
+        if ($null -eq $script:CheckTask) {
+            $now = Get-Date
+            if ($null -ne $script:Watch -and $now -ge $script:Watch.NextAt) {
+                Start-Check -Request $script:Watch.Request -Background
+            }
+            elseif ((Test-AutoRecheck) -and $now -ge $script:NextCheckAt) {
+                Start-Check -Request $script:Current.Request -Background
+            }
         }
         if ($null -ne $script:AskTask) { Update-AskBanner }
         Update-Footer

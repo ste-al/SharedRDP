@@ -7,12 +7,14 @@
 .DESCRIPTION
     Needs an interactive desktop; GitHub's Windows runners have one. The window
     is driven with UI Automation: wait for the first check, open the log, check
-    again, read every text, take screenshots, close the window. With -Dark it
-    runs a second time with the dark app theme (it sets AppsUseLightTheme for the
-    current user and restores it afterwards).
+    again, start and stop watching, check again from the list of recent machines
+    with a mouse click and with Enter, read every text, take screenshots, close
+    the window. With -Dark it runs a second time with the dark app theme (it sets
+    AppsUseLightTheme for the current user and restores it afterwards).
 
     Fails when the window does not open, shows a start-up error, logs an error,
-    shows Unknown, or does not close.
+    shows Unknown, has an action button without an accessible name, or does not
+    close.
 
     powershell.exe -ExecutionPolicy Bypass -File .\tests\Test-Dashboard.ps1 -OutputPath .\out
 #>
@@ -31,6 +33,12 @@ $launcher = Join-Path $root 'SharedRdp-Dashboard.cmd'
 $OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
 $null = New-Item -ItemType Directory -Path $OutputPath -Force
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing, System.Windows.Forms
+if (-not ('SharedRdpTest.Mouse' -as [type])) {
+    Add-Type -Namespace SharedRdpTest -Name Mouse -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")] public static extern void mouse_event(int flags, int dx, int dy, int data, System.IntPtr extra);
+'@
+}
 
 $texts = @(
     'SignWord', 'HostLine', 'Headline', 'Advice', 'NotesText', 'ErrorText',
@@ -71,10 +79,11 @@ function Invoke-Button {
 }
 
 function Wait-For {
-    param([string] $What, [int] $Seconds, [scriptblock] $Condition)
+    # Runs $Condition, with -ArgumentList as its arguments, until it returns something.
+    param([string] $What, [int] $Seconds, [scriptblock] $Condition, [object[]] $ArgumentList = @())
     $deadline = (Get-Date).AddSeconds($Seconds)
     while ((Get-Date) -lt $deadline) {
-        $value = & $Condition
+        $value = & $Condition @ArgumentList
         if ($value) { return $value }
         Start-Sleep -Milliseconds 400
     }
@@ -117,8 +126,79 @@ function Get-Snapshot {
     return $snapshot
 }
 
+function Get-CheckLine {
+    # The machines the dashboard has started checks of, from its log, in order.
+    param($Window)
+    $log = [string] (Get-Text -Parent $Window -Id 'LogBox')
+    return @([regex]::Matches($log, 'Checking (\S+) as ') | ForEach-Object { $_.Groups[1].Value })
+}
+
+function Wait-ForCheck {
+    # Waits until a check after the first $Before ones has started and finished.
+    param($Window, [int] $Before, [string] $What, [int] $Seconds)
+    $null = Wait-For -What $What -Seconds $Seconds -ArgumentList $Window, $Before -Condition {
+        param($In, [int] $Count)
+        $button = Find-ById -Parent $In -Id 'CheckButton'
+        (@(Get-CheckLine -Window $In).Count -gt $Count) -and $null -ne $button -and $button.Current.IsEnabled
+    }
+}
+
+function Set-Text {
+    param($Parent, [string] $Id, [string] $Text)
+    $element = Find-ById -Parent $Parent -Id $Id
+    if ($null -eq $element) { throw ('text box {0} not found' -f $Id) }
+    $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Text)
+}
+
+function Find-RecentItem {
+    # The entry for a machine in the list of recent machines; its accessible name
+    # starts with the machine.
+    param($Window, [string] $HostName)
+    $list = Find-ById -Parent $Window -Id 'RecentList'
+    if ($null -eq $list) { return $null }
+    foreach ($item in $list.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+        if ($item.Current.Name -like ('{0},*' -f $HostName)) { return $item }
+    }
+    return $null
+}
+
+function Invoke-Click {
+    # A real left click in the middle of the element, the way a person clicks.
+    param($Element)
+    $point = $Element.GetClickablePoint()
+    $null = [SharedRdpTest.Mouse]::SetCursorPos([int] $point.X, [int] $point.Y)
+    Start-Sleep -Milliseconds 200
+    [SharedRdpTest.Mouse]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
+    [SharedRdpTest.Mouse]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
+}
+
+function Test-RecentEntry {
+    # Puts another machine in the form, then picks this one from the recent list:
+    # it must come back into the form and be checked, not the machine in the form.
+    param($Window, [string] $HostName, [ValidateSet('Click', 'Enter')] [string] $How, [int] $Seconds)
+    $decoy = 'not-this-one.invalid'
+    Set-Text -Parent $Window -Id 'HostBox' -Text $decoy
+    $item = Wait-For -What ('{0} in the recent list' -f $HostName) -Seconds 10 -Condition { Find-RecentItem -Window $Window -HostName $HostName }
+    $before = @(Get-CheckLine -Window $Window).Count
+    if ($How -eq 'Click') {
+        Invoke-Click -Element $item
+    }
+    else {
+        $item.SetFocus()
+        Start-Sleep -Milliseconds 300
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    }
+    Wait-ForCheck -Window $Window -Before $before -What ('the check from the recent list ({0})' -f $How) -Seconds $Seconds
+    $checked = @(Get-CheckLine -Window $Window)[$before]
+    $form = Get-Text -Parent $Window -Id 'HostBox'
+    if ($checked -ne $HostName -or $form -ne $HostName) {
+        throw ('{0} on the recent entry checked [{1}] with [{2}] in the form; expected {3}' -f $How, $checked, $form, $HostName)
+    }
+    Write-Host ('  {0} on the recent entry checked {1} again' -f $How, $HostName)
+}
+
 function Test-DashboardRun {
-    param([string] $Theme)
+    param([string] $Theme, [string] $ComputerName, [int] $TimeoutSeconds)
     $prefix = Join-Path $OutputPath ('dashboard-{0}' -f $Theme)
     Write-Host ''
     Write-Host ('Dashboard, {0} theme: opening it through SharedRdp-Dashboard.cmd -ComputerName {1}' -f $Theme, $ComputerName) -ForegroundColor Cyan
@@ -144,27 +224,47 @@ function Test-DashboardRun {
         Save-Screen -Path ($prefix + '.png') -Window $window
 
         Invoke-Button -Parent $window -Id 'LogToggle'
-        $log = [string] (Wait-For -What 'the log' -Seconds 10 -Condition { Get-Text -Parent $window -Id 'LogBox' })
-        $checksBefore = [regex]::Matches($log, 'Checking \S+ as ').Count
+        $null = Wait-For -What 'the log' -Seconds 10 -Condition { Get-Text -Parent $window -Id 'LogBox' }
+        $checksBefore = @(Get-CheckLine -Window $window).Count
         Invoke-Button -Parent $window -Id 'CheckButton'
-        $null = Wait-For -What 'the second check' -Seconds $TimeoutSeconds -Condition {
-            $button = Find-ById -Parent $window -Id 'CheckButton'
-            $current = [string] (Get-Text -Parent $window -Id 'LogBox')
-            ([regex]::Matches($current, 'Checking \S+ as ').Count -gt $checksBefore) -and $button.Current.IsEnabled
-        }
+        Wait-ForCheck -Window $window -Before $checksBefore -What 'the second check' -Seconds $TimeoutSeconds
         Save-Screen -Path ($prefix + '-log.png') -Window $window
-        $log = [string] (Get-Text -Parent $window -Id 'LogBox')
-        Set-Content -LiteralPath ($prefix + '-log.txt') -Value $log -Encoding UTF8
-        $second = Get-Snapshot -Window $window
-        $lines = @(foreach ($key in $second.Keys) { '{0}: {1}' -f $key, $second[$key] })
-        Set-Content -LiteralPath ($prefix + '.txt') -Value $lines -Encoding UTF8
 
         $problems = @()
+        # Buttons that show an icon and a text need a name of their own for screen readers.
+        foreach ($id in 'ConnectButton', 'AskButton', 'WatchButton', 'NotifyButton') {
+            $button = Find-ById -Parent $window -Id $id
+            if ($null -eq $button -or -not $button.Current.Name) { $problems += ('{0} has no accessible name' -f $id) }
+        }
+
+        $notify = Find-ById -Parent $window -Id 'NotifyButton'
+        if ($null -ne $notify -and $notify.Current.IsEnabled) {
+            Invoke-Button -Parent $window -Id 'NotifyButton'
+            $null = Wait-For -What 'the watch to start' -Seconds 10 -Condition { (Get-Text -Parent $window -Id 'BannerText') -like 'Watching *' }
+            $name = (Find-ById -Parent $window -Id 'NotifyButton').Current.Name
+            if ($name -ne 'Stop watching') { $problems += ('while watching, the button is named [{0}]' -f $name) }
+            Invoke-Button -Parent $window -Id 'NotifyButton'
+            $null = Wait-For -What 'the watch to stop' -Seconds 10 -Condition { (Get-Text -Parent $window -Id 'BannerText') -like 'Stopped watching *' }
+            Write-Host '  Started and stopped watching.'
+        }
+        else {
+            Write-Host ('  Watching is not offered for {0}: {1}' -f $first.SignWord, $notify.Current.HelpText)
+        }
+
+        Test-RecentEntry -Window $window -HostName $ComputerName -How Click -Seconds $TimeoutSeconds
+        Test-RecentEntry -Window $window -HostName $ComputerName -How Enter -Seconds $TimeoutSeconds
+
+        $log = [string] (Get-Text -Parent $window -Id 'LogBox')
+        Set-Content -LiteralPath ($prefix + '-log.txt') -Value $log -Encoding UTF8
+        $last = Get-Snapshot -Window $window
+        $lines = @(foreach ($key in $last.Keys) { '{0}: {1}' -f $key, $last[$key] })
+        Set-Content -LiteralPath ($prefix + '.txt') -Value $lines -Encoding UTF8
+
         $logErrors = @($log -split "`r?`n" | Where-Object { $_ -match '^\d\d:\d\d:\d\d  ERROR' })
         if ($logErrors.Count -gt 0) { $problems += ('the log has errors: {0}' -f ($logErrors -join ' / ')) }
-        if ($second.SignWord -eq 'Unknown') { $problems += ('the check failed: {0}' -f $second.ErrorText) }
-        if ($second.SessionsTitle -notmatch '^People signed in \(\d+\)$') { $problems += ('unexpected sessions title: {0}' -f $second.SessionsTitle) }
-        if ($second.VersionText -notmatch '^Dashboard \S+, engine \S+$') { $problems += ('unexpected version line: {0}' -f $second.VersionText) }
+        if ($last.SignWord -eq 'Unknown') { $problems += ('the check failed: {0}' -f $last.ErrorText) }
+        if ($last.SessionsTitle -notmatch '^People signed in \(\d+\)$') { $problems += ('unexpected sessions title: {0}' -f $last.SessionsTitle) }
+        if ($last.VersionText -notmatch '^Dashboard \S+, engine \S+$') { $problems += ('unexpected version line: {0}' -f $last.VersionText) }
         if ($problems.Count -gt 0) { throw ($problems -join '; ') }
 
         $window.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close()
@@ -196,7 +296,7 @@ foreach ($theme in $themes) {
     if ($theme -eq 'dark') { $light = 0 }
     Set-ItemProperty -LiteralPath $personalize -Name AppsUseLightTheme -Value $light -Type DWord
     try {
-        Test-DashboardRun -Theme $theme
+        Test-DashboardRun -Theme $theme -ComputerName $ComputerName -TimeoutSeconds $TimeoutSeconds
     }
     catch {
         $failures++
