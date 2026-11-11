@@ -49,3 +49,14 @@ jobs:
           name: screenshots-and-logs
           path: out/
           if-no-files-found: ignore
+
+      - name: Print the screenshots into the log
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem out -Filter *.png | ForEach-Object {
+            "=====BEGIN $($_.Name)====="
+            $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName))
+            for ($i = 0; $i -lt $b64.Length; $i += 4000) { $b64.Substring($i, [Math]::Min(4000, $b64.Length - $i)) }
+            "=====END $($_.Name)====="
+          }
