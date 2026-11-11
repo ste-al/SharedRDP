@@ -314,7 +314,7 @@ $script:XamlTemplate = @'
     </Style>
     <Style x:Key="FactValue" TargetType="TextBlock">
       <Setter Property="FontFamily" Value="Bahnschrift, Segoe UI"/>
-      <Setter Property="FontSize" Value="21"/>
+      <Setter Property="FontSize" Value="20"/>
       <Setter Property="Margin" Value="0,3,0,1"/>
       <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
     </Style>
@@ -427,7 +427,7 @@ $script:XamlTemplate = @'
     </DockPanel>
 
     <ScrollViewer x:Name="PageScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False">
-    <Grid MinHeight="520" Height="{Binding ViewportHeight, ElementName=PageScroll}">
+    <Grid MinHeight="{Binding ViewportHeight, ElementName=PageScroll}">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="280"/>
         <ColumnDefinition Width="32"/>
@@ -478,10 +478,16 @@ $script:XamlTemplate = @'
               <ColumnDefinition Width="220"/>
               <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
-            <Border x:Name="SignBlock" Grid.Column="0" CornerRadius="11,0,0,11" Background="@Raised@" Padding="22,20,18,20">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <Border x:Name="SignBlock" Grid.Column="0" CornerRadius="11,0,0,11" Background="@Raised@" Padding="22,20,18,20" MinHeight="150">
               <DockPanel>
                 <TextBlock x:Name="SignGlyph" DockPanel.Dock="Top" FontFamily="Segoe MDL2 Assets" FontSize="26" Foreground="@Muted@" Text="&#xE721;"/>
-                <TextBlock x:Name="SignWord" VerticalAlignment="Bottom" Margin="0,24,0,0" FontFamily="Bahnschrift, Segoe UI" FontSize="34" LineHeight="38" TextWrapping="Wrap" Foreground="@Ink2@" Text="Not checked"/>
+                <Viewbox StretchDirection="DownOnly" HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="0,24,0,0">
+                  <TextBlock x:Name="SignWord" FontFamily="Bahnschrift, Segoe UI" FontSize="34" Foreground="@Ink2@" Text="Not checked"/>
+                </Viewbox>
               </DockPanel>
             </Border>
             <StackPanel Grid.Column="1" Margin="26,20,24,20">
@@ -493,37 +499,32 @@ $script:XamlTemplate = @'
               <Border x:Name="ErrorBox" Visibility="Collapsed" Margin="0,14,0,0" Background="@Raised@" BorderBrush="@Line@" BorderThickness="1" CornerRadius="6" Padding="12,10">
                 <TextBox x:Name="ErrorText" IsReadOnly="True" TextWrapping="Wrap" Background="Transparent" BorderThickness="0" Padding="0" FontSize="13"/>
               </Border>
-              <Border x:Name="Facts" Visibility="Collapsed" Margin="0,18,0,0" Padding="0,14,0,0" BorderBrush="@Line@" BorderThickness="0,1,0,0">
-                <Grid>
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="*"/>
-                  </Grid.ColumnDefinitions>
-                  <StackPanel Grid.Column="0" Margin="0,0,16,0">
-                    <TextBlock x:Name="Fact1Label" Style="{StaticResource FactLabel}"/>
-                    <TextBlock x:Name="Fact1Value" Style="{StaticResource FactValue}"/>
-                    <TextBlock x:Name="Fact1Sub" Style="{StaticResource FactSub}"/>
-                  </StackPanel>
-                  <StackPanel Grid.Column="1" Margin="0,0,16,0">
-                    <TextBlock x:Name="Fact2Label" Style="{StaticResource FactLabel}"/>
-                    <TextBlock x:Name="Fact2Value" Style="{StaticResource FactValue}"/>
-                    <TextBlock x:Name="Fact2Sub" Style="{StaticResource FactSub}"/>
-                  </StackPanel>
-                  <StackPanel Grid.Column="2" Margin="0,0,16,0">
-                    <TextBlock x:Name="Fact3Label" Style="{StaticResource FactLabel}"/>
-                    <TextBlock x:Name="Fact3Value" Style="{StaticResource FactValue}"/>
-                    <TextBlock x:Name="Fact3Sub" Style="{StaticResource FactSub}"/>
-                  </StackPanel>
-                  <StackPanel Grid.Column="3">
-                    <TextBlock x:Name="Fact4Label" Style="{StaticResource FactLabel}"/>
-                    <TextBlock x:Name="Fact4Value" Style="{StaticResource FactValue}"/>
-                    <TextBlock x:Name="Fact4Sub" Style="{StaticResource FactSub}"/>
-                  </StackPanel>
-                </Grid>
-              </Border>
             </StackPanel>
+            <!-- The facts run under both the sign and the text, so they have room at 1024 pixels. -->
+            <Border x:Name="Facts" Grid.Row="1" Grid.ColumnSpan="2" Visibility="Collapsed" Padding="22,14,12,8" BorderBrush="@Line@" BorderThickness="0,1,0,0">
+              <UniformGrid x:Name="FactsGrid" Columns="4">
+                <StackPanel Margin="0,0,12,8">
+                  <TextBlock x:Name="Fact1Label" Style="{StaticResource FactLabel}"/>
+                  <TextBlock x:Name="Fact1Value" Style="{StaticResource FactValue}"/>
+                  <TextBlock x:Name="Fact1Sub" Style="{StaticResource FactSub}"/>
+                </StackPanel>
+                <StackPanel Margin="0,0,12,8">
+                  <TextBlock x:Name="Fact2Label" Style="{StaticResource FactLabel}"/>
+                  <TextBlock x:Name="Fact2Value" Style="{StaticResource FactValue}"/>
+                  <TextBlock x:Name="Fact2Sub" Style="{StaticResource FactSub}"/>
+                </StackPanel>
+                <StackPanel Margin="0,0,12,8">
+                  <TextBlock x:Name="Fact3Label" Style="{StaticResource FactLabel}"/>
+                  <TextBlock x:Name="Fact3Value" Style="{StaticResource FactValue}"/>
+                  <TextBlock x:Name="Fact3Sub" Style="{StaticResource FactSub}"/>
+                </StackPanel>
+                <StackPanel Margin="0,0,12,8">
+                  <TextBlock x:Name="Fact4Label" Style="{StaticResource FactLabel}"/>
+                  <TextBlock x:Name="Fact4Value" Style="{StaticResource FactValue}"/>
+                  <TextBlock x:Name="Fact4Sub" Style="{StaticResource FactSub}"/>
+                </StackPanel>
+              </UniformGrid>
+            </Border>
           </Grid>
         </Border>
 
@@ -1102,8 +1103,20 @@ function Get-FriendlyText {
         }
         'InUse' {
             $headline = '{0} is working on {1} right now.' -f $name, $hostName
-            if ($null -ne $s.IdleTime) { $advice = 'Last keyboard or mouse input {0} ago. Connecting would cut them off without warning; ask first, or wait.' -f (Format-Span $s.IdleTime) }
-            else { $advice = 'Windows gives no input time for this session ({0}). Connecting would cut them off; ask first, or wait.' -f $s.IdleNote }
+            if ($null -ne $s.IdleTime) {
+                $advice = 'Last keyboard or mouse input {0} ago. Connecting would cut them off without warning; ask first, or wait.' -f (Format-Span $s.IdleTime)
+            }
+            elseif ($s.Protocol -eq 'Console') {
+                # Windows never reports input times for the console, so "working" would be a guess.
+                $headline = '{0} is signed in directly at {1}.' -f $name, $hostName
+                $advice = 'Windows does not report keyboard or mouse input for the machine''s own screen, so they may be working right now. Connecting would cut them off; ask first, or wait.'
+            }
+            elseif ($s.IdleNote -and $s.IdleNote -ne 'idle time not reported') {
+                $advice = 'Windows gives no input time for this session: {0}. Connecting would cut them off; ask first, or wait.' -f $s.IdleNote
+            }
+            else {
+                $advice = 'Windows gives no input time for this session. Connecting would cut them off; ask first, or wait.'
+            }
         }
         'Busy' {
             $headline = 'Automation is running in {0}''s session.' -f $name
@@ -1124,7 +1137,11 @@ function Get-FriendlyText {
 function Get-ClientText {
     # Where a session is (or was last) connected from, as a main line and a sub line.
     param($Session, $Lookup)
-    if ($Session.Protocol -eq 'Console') { return @{ Main = 'Its own screen'; Sub = 'the physical console' } }
+    if ($Session.Protocol -eq 'Console') {
+        $sub = 'at the machine itself'
+        if ($Session.Resolution) { $sub = '{0} display' -f $Session.Resolution }
+        return @{ Main = 'Its own screen'; Sub = $sub }
+    }
     if ($Session.Client -or $Session.ClientAddress) {
         $main = [string] $Session.Client
         if (-not $main) { $main = [string] $Session.ClientAddress }
@@ -1221,7 +1238,12 @@ function Show-Facts {
         }
         'Idle' { Set-Fact -Index 1 -Label 'No input for' -Value (Format-Span $s.IdleTime) -Sub 'keyboard and mouse untouched' }
         'InUse' {
-            if ($null -eq $s.IdleTime) { Set-Fact -Index 1 -Label 'Last input' -Value 'Not reported' -Sub ([string] $s.IdleNote) }
+            if ($null -eq $s.IdleTime) {
+                $sub = ''
+                if ($s.Protocol -eq 'Console') { $sub = 'not for the console' }
+                elseif ($s.IdleNote -ne 'idle time not reported') { $sub = [string] $s.IdleNote }
+                Set-Fact -Index 1 -Label 'Last input' -Value 'Not reported' -Sub $sub
+            }
             elseif ($s.IdleTime.TotalSeconds -lt 60) { Set-Fact -Index 1 -Label 'Last input' -Value 'Just now' -Sub 'keyboard or mouse' }
             else { Set-Fact -Index 1 -Label 'Last input' -Value ('{0} ago' -f (Format-Span $s.IdleTime)) -Sub 'keyboard or mouse' }
         }
@@ -1283,6 +1305,10 @@ function Show-Result {
         $script:ui.Facts.Visibility = [System.Windows.Visibility]::Visible
         Show-Facts -Result $result -Request $request -Lookup $lookup
     }
+    # The sign's lower corner is square when the facts strip runs under it.
+    $lower = 11
+    if ($script:ui.Facts.Visibility -eq [System.Windows.Visibility]::Visible) { $lower = 0 }
+    $script:ui.SignBlock.CornerRadius = New-Object System.Windows.CornerRadius -ArgumentList 11, 0, 0, $lower
     $script:ui.IdentityText.Text = 'Checked as {0}' -f $request.Settings.CheckingAs
     Update-Actions
     Show-Sessions
@@ -1877,6 +1903,14 @@ $script:ui.AutoBox.Add_Click({
         $script:NextCheckAt = (Get-Date).AddSeconds($script:Options.Refresh)
         Update-Footer
         Save-DashboardSettings
+    }
+})
+$script:ui.FactsGrid.Add_SizeChanged({
+    Invoke-Safely {
+        # Four facts side by side need about 560 pixels; narrower, they go two by two.
+        $columns = 4
+        if ($script:ui.FactsGrid.ActualWidth -lt 560) { $columns = 2 }
+        if ($script:ui.FactsGrid.Columns -ne $columns) { $script:ui.FactsGrid.Columns = $columns }
     }
 })
 $script:ui.HostBox.Add_TextChanged({ Invoke-Safely { Update-PassHint } })

@@ -267,7 +267,9 @@ Test-Case 'the dashboard window helper compiles' {
 Write-Section 'Window layout'
 $template = [string] @(Get-AssignedExpression -Name '$script:XamlTemplate')[0].Value
 $palettes = @(Get-AssignedExpression -Name '$script:Palette' | ForEach-Object { $_.SafeGetValue() })
-$xamlNames = @([regex]::Matches($template, 'x:Name="(\w+)"') | ForEach-Object { $_.Groups[1].Value })
+# Names inside a control template belong to each control that uses it, not to the window.
+$windowXaml = [regex]::Replace($template, '(?s)<ControlTemplate\b.*?</ControlTemplate>', '')
+$xamlNames = @([regex]::Matches($windowXaml, 'x:Name="(\w+)"') | ForEach-Object { $_.Groups[1].Value })
 $tableMembers = @('ContainsKey', 'Keys', 'Values', 'Count')
 $codeNames = @([regex]::Matches($dashboardText, '\$script:ui\.(\w+)') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $tableMembers -notcontains $_ } | Sort-Object -Unique)
 $styleNames = @([regex]::Matches($dashboardText, "FindResource\('(\w+)'\)") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
@@ -512,6 +514,13 @@ Test-Case 'disconnected: nobody is watching' {
 Test-Case 'free while others are signed in: the account has no session' {
     $result = Resolve-HostStatus -ComputerName $lab -Sessions @($script:IdleUser) -TargetUser 'Administrator'
     Assert-Equal 'Administrator has no session on LAB-07.' (Get-FriendlyText -Result $result -Request $request).Headline 'headline'
+}
+
+Test-Case 'the console without input times: signed in, not claimed to be working' {
+    $result = Resolve-HostStatus -ComputerName $lab -Sessions @($script:ConsoleUser) -TargetUser 'tester'
+    $copy = Get-FriendlyText -Result $result -Request ([pscustomobject]@{ Host = 'LAB-07'; Account = 'tester' })
+    Assert-Equal 'tester is signed in directly at LAB-07.' $copy.Headline 'headline'
+    Assert-Match 'own screen' $copy.Advice 'advice'
 }
 
 Test-Case 'unknown: says why' {
