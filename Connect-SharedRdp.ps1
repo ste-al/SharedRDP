@@ -175,7 +175,7 @@ param(
     [string] $LogPath
 )
 
-$script:ScriptVersion = '1.5'
+$script:ScriptVersion = '1.6'
 
 #region Native layer (Remote Desktop Services API)
 
@@ -188,7 +188,7 @@ using System.Security;
 
 // The namespace changes with the code, because a PowerShell session keeps the
 // first compiled copy of a type and cannot load a changed one under that name.
-namespace SharedRdpV2
+namespace SharedRdpV3
 {
     public sealed class SessionRecord
     {
@@ -197,6 +197,7 @@ namespace SharedRdpV2
         public int State = -1;              // WTS_CONNECTSTATE_CLASS
         public int Flags = -1;              // 0 = locked, 1 = unlocked, -1 = unknown
         public bool HasInfoEx;
+        public int IdentityError;           // the user/domain could not be read; 0 = known
         public string UserName = "";
         public string DomainName = "";
         public long LogonTime;              // FILETIME (UTC); 0 = not reported
@@ -427,10 +428,25 @@ namespace SharedRdpV2
 
         static string QueryString(IntPtr handle, int sessionId, int infoClass)
         {
+            int error;
+            return QueryString(handle, sessionId, infoClass, out error);
+        }
+
+        static string QueryString(IntPtr handle, int sessionId, int infoClass, out int error)
+        {
             IntPtr buffer;
             int bytes;
-            if (Query(handle, sessionId, infoClass, out buffer, out bytes) != 0) return null;
-            try { return buffer == IntPtr.Zero ? null : Marshal.PtrToStringUni(buffer); }
+            error = Query(handle, sessionId, infoClass, out buffer, out bytes);
+            if (error != 0) return null;
+            try
+            {
+                if (buffer == IntPtr.Zero || bytes < 2)
+                {
+                    error = 13;            // ERROR_INVALID_DATA, not a known empty name
+                    return null;
+                }
+                return Marshal.PtrToStringUni(buffer);
+            }
             finally { Free(buffer); }
         }
 
@@ -458,10 +474,21 @@ namespace SharedRdpV2
             }
             if (!haveEx)
             {
-                string s = QueryString(handle, r.SessionId, WTSUserName);
+                int identityError;
+                string s = QueryString(handle, r.SessionId, WTSUserName, out identityError);
+                r.IdentityError = identityError;
+                if (identityError != 0) AddProblem(r, "user name", identityError);
                 if (s != null) r.UserName = s;
-                s = QueryString(handle, r.SessionId, WTSDomainName);
-                if (s != null) r.DomainName = s;
+                if (!string.IsNullOrEmpty(r.UserName))
+                {
+                    s = QueryString(handle, r.SessionId, WTSDomainName, out identityError);
+                    if (s != null) r.DomainName = s;
+                    if (identityError != 0)
+                    {
+                        r.IdentityError = identityError;
+                        AddProblem(r, "domain name", identityError);
+                    }
+                }
             }
             if (string.IsNullOrEmpty(r.UserName)) return;     // nobody signed in to this one
 
@@ -621,7 +648,14 @@ namespace SharedRdpV2
         {
             if (active)
             {
-                NativeAuth.RevertToSelf();
+                if (!NativeAuth.RevertToSelf())
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    // Microsoft requires terminating when reverting fails: a
+                    // pooled worker must never return with another identity.
+                    Environment.FailFast("Could not restore the original identity after a Remote Desktop check.",
+                        Errors.Wrap(error, "RevertToSelf"));
+                }
                 active = false;
             }
             if (token != IntPtr.Zero)
@@ -662,7 +696,7 @@ namespace SharedRdpV2
 '@
 
 function Initialize-Native {
-    if (-not ('SharedRdpV2.Wts' -as [type])) {
+    if (-not ('SharedRdpV3.Wts' -as [type])) {
         Add-Type -TypeDefinition $script:NativeSource -Language CSharp -ErrorAction Stop
     }
 }
@@ -675,19 +709,19 @@ function Get-RawSessions {
         if ($c.Domain) { $signIn = '{0}\{1}' -f $c.Domain, $c.User }
         Write-CheckLog -Message ('{0}: network sign-in as {1} with the password given' -f $ComputerName, $signIn)
     }
-    [SharedRdpV2.Wts]::GetSessions($ComputerName, $c.Domain, $c.User, $c.Password)
+    [SharedRdpV3.Wts]::GetSessions($ComputerName, $c.Domain, $c.User, $c.Password)
 }
 
 function Get-RawProcesses {
     param([string] $ComputerName, [System.Management.Automation.PSCredential] $Credential)
     $c = ConvertTo-NativeCredential -Credential $Credential -ComputerName $ComputerName
-    [SharedRdpV2.Wts]::GetProcesses($ComputerName, $c.Domain, $c.User, $c.Password)
+    [SharedRdpV3.Wts]::GetProcesses($ComputerName, $c.Domain, $c.User, $c.Password)
 }
 
 function Send-AskMessage {
     param([string] $ComputerName, [int] $SessionId, [string] $Title, [string] $Message, [int] $TimeoutSeconds, [System.Management.Automation.PSCredential] $Credential)
     $c = ConvertTo-NativeCredential -Credential $Credential -ComputerName $ComputerName
-    [SharedRdpV2.Wts]::AskSession($ComputerName, $SessionId, $Title, $Message, $TimeoutSeconds, $c.Domain, $c.User, $c.Password)
+    [SharedRdpV3.Wts]::AskSession($ComputerName, $SessionId, $Title, $Message, $TimeoutSeconds, $c.Domain, $c.User, $c.Password)
 }
 
 #endregion
@@ -1219,7 +1253,36 @@ function Resolve-HostStatus {
     $leaf = Get-UserLeaf -Name $TargetUser
     if ($leaf) {
         $mine = @($withUser | Where-Object { $_.UserName -eq $leaf })
-        $others = @($withUser | Where-Object { $_.UserName -ne $leaf })
+        $qualified = $TargetUser.Trim()
+        $exact = @($mine | Where-Object { $_.User -eq $qualified })
+        $uncertainQualifier = $false
+        if ($qualified -match '^(?<d>[^\\]+)\\(?<u>.+)$') {
+            $domain = $Matches['d']
+            $hostName = (Split-HostPort -Address $ComputerName).Host
+            $localAlias = ($domain -eq '.' -or $domain -eq $hostName)
+            if (Test-IsLocalName -Name $hostName) { $hostName = [Environment]::MachineName }
+            if ($localAlias) { $domain = Get-NetbiosGuess -ComputerName $hostName }
+            $qualified = '{0}\{1}' -f $domain, $leaf
+            $exact = @($mine | Where-Object { $_.User -eq $qualified })
+            $ip = $null
+            # WTS reports a NetBIOS domain. An IP address or DNS name can be a
+            # local-account alias, whose domain cannot be compared directly.
+            if (-not [System.Net.IPAddress]::TryParse($domain, [ref] $ip) -and $domain -notmatch '[.:]') {
+                $mine = $exact
+            }
+            elseif ($exact.Count -gt 0) { $mine = $exact }
+            elseif (-not $localAlias -and $mine.Count -gt 0) { $uncertainQualifier = $true }
+        }
+        elseif ($exact.Count -gt 0) { $mine = $exact }
+        $others = @($withUser | Where-Object { $mine -notcontains $_ })
+        $identities = @($mine | ForEach-Object { $_.User } | Select-Object -Unique)
+        if ($identities.Count -gt 1 -or $uncertainQualifier) {
+            $result.Sessions = $withUser
+            $result.OtherSessions = $others
+            $result.Detail = 'the shared account could not be matched to one identity'
+            $result.Error = 'Windows reports {0} as {1}. Use the DOMAIN\user name shown by Windows to choose the account before asking or watching a session.' -f $leaf, ($identities -join ', ')
+            return $result
+        }
     }
     else {
         $mine = $withUser
@@ -1257,10 +1320,12 @@ function Test-TcpPort {
     $why = 'no address to try'
     foreach ($ip in @($Address | Where-Object { $null -ne $_ } | Select-Object -First 4)) {
         $client = $null
+        $wait = $null
         try {
             $client = New-Object System.Net.Sockets.TcpClient -ArgumentList $ip.AddressFamily
             $attempt = $client.BeginConnect($ip, $Port, $null, $null)
-            if ($attempt.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            $wait = $attempt.AsyncWaitHandle
+            if ($wait.WaitOne($TimeoutMs)) {
                 $client.EndConnect($attempt)
                 return 'open'
             }
@@ -1271,6 +1336,7 @@ function Test-TcpPort {
         }
         finally {
             if ($null -ne $client) { $client.Close() }
+            if ($null -ne $wait) { $wait.Close() }
         }
     }
     return $why
@@ -1371,12 +1437,14 @@ function Get-HostStatus {
     }
     $busy = @{}
     $notes = @()
+    $busyFailure = $null
     if (@($Settings.BusyProcess | Where-Object { $_ }).Count -gt 0) {
         try {
             $busy = Get-BusySessionMap -ComputerName $Target.QueryHost -Credential $Settings.Credential -Pattern $Settings.BusyProcess
         }
         catch {
             $failure = Get-FailureText -ErrorRecord $_ -Operation Processes -Settings $Settings
+            $busyFailure = $failure
             $notes += ('busy check skipped: {0}' -f $failure.Reason)
             Write-CheckLog -Level Warning -Message ('{0}: busy check skipped: {1}' -f $Target.QueryHost, $failure.Text)
             Write-CheckLog -Message ('{0}: process list failed: {1}' -f $Target.QueryHost, (Format-ExceptionChain -ErrorRecord $_))
@@ -1394,6 +1462,7 @@ function Get-HostStatus {
     $system = @()
     foreach ($r in $raw) {
         if ($null -eq $r -or $r.UserName) { continue }
+        if ($r.SessionId -ne 0 -and $r.State -le 4 -and $null -ne $r.PSObject.Properties['IdentityError'] -and $r.IdentityError -ne 0) { continue }
         $system += [pscustomobject]@{
             SessionId = [int] $r.SessionId
             Name      = [string] $r.WinStationName
@@ -1404,6 +1473,38 @@ function Get-HostStatus {
     $arriving = @($system | Where-Object { $_.Name -notlike 'Console*' -and $_.Name -ne 'Services' -and ($_.State -eq 'Connected' -or $_.State -eq 'ConnectQuery') })
     $result = Resolve-HostStatus -ComputerName $Target.Name -Sessions $views -TargetUser $Target.TargetUser
     $result.SystemSessions = $system
+    # A failed identity query is different from a successfully read empty user
+    # name. Otherwise an inaccessible active/disconnected session looks free,
+    # and the automatic connection could silently take over someone's work.
+    $unreadable = @($raw | Where-Object {
+        $null -ne $_ -and $_.SessionId -ne 0 -and $_.State -le 4 -and
+        $null -ne $_.PSObject.Properties['IdentityError'] -and $_.IdentityError -ne 0
+    })
+    if ($unreadable.Count -gt 0 -or $null -ne $busyFailure) {
+        $result.Status = 'Unknown'
+        # A permission error must not hide a rejected password from another
+        # query; polling has to stop when any query rejects the sign-in.
+        $rejectedIdentity = @($unreadable | Where-Object { Test-SignInRejected -Code $_.IdentityError } | Select-Object -First 1)
+        $useBusyFailure = ($null -ne $busyFailure -and ((Test-SignInRejected -Code $busyFailure.Code) -or $rejectedIdentity.Count -eq 0))
+        if ($useBusyFailure) {
+            $result.Detail = 'the requested busy-process check failed'
+            $result.ErrorCode = $busyFailure.Code
+            $result.Error = $busyFailure.Text
+        }
+        else {
+            $identityFailure = $unreadable[0]
+            if ($rejectedIdentity.Count -gt 0) { $identityFailure = $rejectedIdentity[0] }
+            $result.Detail = 'the account identity of a session could not be read'
+            $result.ErrorCode = [int] $identityFailure.IdentityError
+            $result.Error = 'Windows could not read who is signed in to session {0} (error {1}). Check permissions and try again before connecting.' -f $identityFailure.SessionId, $result.ErrorCode
+        }
+        $result.Session = $null
+        $result.SessionId = $null
+        $result.User = ''
+        $result.Who = ''
+        $result.Client = ''
+        $result.ClientAddress = ''
+    }
     if ($arriving.Count -gt 0) {
         $notes += ('someone is connecting over Remote Desktop right now (session {0}) and has not signed in yet' -f (($arriving | ForEach-Object { $_.SessionId }) -join ', '))
         if ($result.Status -eq 'Free') {
@@ -1645,11 +1746,62 @@ function Wait-OrQuit {
 
 #region Actions
 
+function Get-RdpConnectionLines {
+    # Copy display/device preferences, but never a saved password or an old
+    # target identity. A value must fit on one RDP settings line.
+    param($Request, [string[]] $TemplateLines = @())
+    if ([string]::IsNullOrWhiteSpace($Request.Host) -or $Request.Host -match '[\x00-\x20\x7F"]') {
+        throw 'The machine must be a name or IP address without spaces, quotes or control characters.'
+    }
+    if ($Request.Account -match '[\x00-\x1F\x7F]') { throw 'The account cannot contain control characters.' }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $TemplateLines) {
+        if (-not $line -or $line -match '^\s*(full address|alternate full address|username|domain|password(?: 51)?)\s*:') { continue }
+        $lines.Add($line)
+    }
+    $lines.Add(('full address:s:{0}' -f (Format-MstscHost -Address $Request.Host)))
+    if ($Request.Account) { $lines.Add(('username:s:{0}' -f $Request.Account)) }
+    return $lines.ToArray()
+}
+
 function Start-Rdp {
     param([Parameter(Mandatory = $true)] $Target, [string[]] $ExtraArgument = @())
+    $rdpPath = [string] $Target.RdpFile
+    if ($Target.TargetUser) {
+        $rewrite = -not $rdpPath
+        if ($rdpPath) {
+            $info = Read-RdpFile -Path $rdpPath
+            $rewrite = ($info.UserName -ne $Target.TargetUser)
+        }
+        if ($rewrite) {
+            $templateLines = @()
+            if ($rdpPath) { $templateLines = @(Get-Content -LiteralPath $rdpPath -ErrorAction Stop) }
+            else {
+                $documents = [Environment]::GetFolderPath('MyDocuments')
+                if ($documents) {
+                    $template = Join-Path $documents 'Default.rdp'
+                    if (Test-Path -LiteralPath $template -PathType Leaf) { $templateLines = @(Get-Content -LiteralPath $template -ErrorAction Stop) }
+                }
+            }
+            $account = [string] $Target.TargetUser
+            if ($account -notmatch '[\\@]') {
+                $hostName = [string] $Target.QueryHost
+                if (Test-IsLocalName -Name $hostName) { $hostName = [Environment]::MachineName }
+                $account = '{0}\{1}' -f (Get-NetbiosGuess -ComputerName $hostName), $account
+            }
+            $request = [pscustomobject]@{ Host = $Target.Name; Account = $account }
+            $lines = @(Get-RdpConnectionLines -Request $request -TemplateLines $templateLines)
+            $folder = Join-Path ([System.IO.Path]::GetTempPath()) 'SharedRdp'
+            if (-not (Test-Path -LiteralPath $folder)) { $null = New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop }
+            # mstsc reads asynchronously and can outlive this command. Keep a
+            # unique settings file in the temporary folder; it has no password.
+            $rdpPath = Join-Path $folder ('{0}.rdp' -f [guid]::NewGuid().ToString('N'))
+            Set-Content -LiteralPath $rdpPath -Value $lines -Encoding Unicode -ErrorAction Stop
+        }
+    }
     $parts = New-Object System.Collections.Generic.List[string]
-    if ($Target.RdpFile) { $parts.Add(('"{0}"' -f $Target.RdpFile)) }
-    if (-not $Target.RdpFile -or $Target.OverrideHost) { $parts.Add(('/v:{0}' -f (Format-MstscHost -Address $Target.Name))) }
+    if ($rdpPath) { $parts.Add(('"{0}"' -f $rdpPath)) }
+    if (-not $rdpPath -or $Target.OverrideHost) { $parts.Add(('/v:{0}' -f (Format-MstscHost -Address $Target.Name))) }
     foreach ($a in @($ExtraArgument)) { if ($a) { $parts.Add([string] $a) } }
     $line = $parts -join ' '
     Write-Host ('Starting Remote Desktop: mstsc {0}' -f $line) -ForegroundColor DarkGray
@@ -1852,12 +2004,15 @@ function Select-Target {
 function Read-RdpFile {
     param([Parameter(Mandatory = $true)] [string] $Path)
     $info = [pscustomobject]@{ Address = ''; UserName = ''; Gateway = ''; GatewayUsage = -1 }
+    $domain = ''
     foreach ($line in @(Get-Content -LiteralPath $Path)) {
         if ($line -match '^\s*full address:s:(.+?)\s*$') { $info.Address = $Matches[1] }
         elseif ($line -match '^\s*username:s:(.+?)\s*$') { $info.UserName = $Matches[1] }
+        elseif ($line -match '^\s*domain:s:(.+?)\s*$') { $domain = $Matches[1] }
         elseif ($line -match '^\s*gatewayhostname:s:(.+?)\s*$') { $info.Gateway = $Matches[1] }
         elseif ($line -match '^\s*gatewayusagemethod:i:(\d+)') { $info.GatewayUsage = [int] $Matches[1] }
     }
+    if ($domain -and $info.UserName -and $info.UserName -notmatch '[\\@]') { $info.UserName = '{0}\{1}' -f $domain, $info.UserName }
     return $info
 }
 

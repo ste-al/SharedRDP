@@ -9,6 +9,10 @@ one. These scripts read the machine's session list instead, which never touches
 a session, and say in plain words whether it is free, in use, idle, locked or
 disconnected, who is connected, from which computer, and since when.
 
+If Windows cannot identify a session or complete a requested busy-process
+check, the answer stays **Unknown**. A failed check never counts as proof that
+the machine is free.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/dashboard-dark.png">
   <img src="docs/dashboard-light.png" alt="The dashboard after checking a machine: an In use sign, who is signed in and since when, the buttons Connect anyway, Ask to take over, Watch and Tell me when it's free, and the list of people signed in.">
@@ -106,8 +110,9 @@ empty to check as yourself; then every session on the machine counts, and the
 busiest one decides.
 
 - **Connect** opens Remote Desktop with the machine and the account filled in,
-  using your own defaults from `Documents\Default.rdp`. When that would cut
-  someone off, it asks you first.
+  using your own defaults from `Documents\Default.rdp`. Saved passwords in
+  those defaults are discarded. When that would cut someone off, it asks
+  you first.
 - **Ask to take over** shows a Yes/No box in their session. If they click Yes,
   Remote Desktop opens for you. It waits 60 seconds for an answer.
 - **Watch (view only)** opens a view-only copy of their screen
@@ -131,7 +136,9 @@ account out. The machine and account names of recent checks are saved in
 `%APPDATA%\SharedRdp\dashboard.json`, so you can check them again with one
 click, or with the arrow keys and Enter. A bare account name such as
 `Administrator` means a local account on that machine, shown as
-`MACHINE\Administrator`.
+`MACHINE\Administrator`. When Windows reports different accounts with the same
+user name, use `DOMAIN\user` to choose one explicitly; an ambiguous account
+is reported as **Unknown**.
 
 Options, for a shortcut or the console:
 
@@ -216,6 +223,15 @@ Through an RD Gateway the check cannot reach the machine.
 - **The event log lookup** reads sign-in, disconnect and reconnect events (21,
   24, 25) from `Microsoft-Windows-TerminalServices-LocalSessionManager/Operational`.
 
+When an account needs to be filled in, the command line and dashboard use
+a unique temporary `.rdp` file containing the chosen machine and account,
+without a password. The dashboard removes its file after that Remote Desktop
+process exits. A file can remain in `%TEMP%\SharedRdp` when the command line
+finishes or the dashboard closes while Remote Desktop is still running.
+
+If Windows ever fails to restore the original identity after a network check,
+the application terminates instead of reusing a worker under the wrong account.
+
 ## Checks
 
 Every pull request and every push to `main` runs the scripts in `tests/` on a
@@ -226,6 +242,12 @@ GitHub-hosted Windows runner:
   light and dark theme at two sizes, the status logic and the dashboard's
   wording on made-up sessions, the port test over IPv4 and IPv6, and a
   background check of the runner.
+- `Test-EngineRegression.ps1`, `Test-DashboardRegression.ps1`, and
+  `Test-CiSafety.ps1`: session identity and account selection, failed busy
+  checks, safe RDP settings, background credential changes, queued checks,
+  and temporary account cleanup. These tests use synthetic data and mocks;
+  they do not open Remote Desktop or change Windows accounts. They run in
+  both PowerShell versions.
 - `Invoke-Analyzer.ps1`: PSScriptAnalyzer with every rule except the few that
   `PSScriptAnalyzerSettings.psd1` leaves out, each with its reason; errors and
   warnings fail the run.
@@ -242,6 +264,9 @@ checks that change nothing on your own computer:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\tests\Test-Scripts.ps1 -OutputPath .\out
+powershell.exe -ExecutionPolicy Bypass -File .\tests\Test-EngineRegression.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\tests\Test-DashboardRegression.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\tests\Test-CiSafety.ps1
 ```
 
 `Test-CommandLine.ps1 -CiSetup` changes the machine (it sets `AllowRemoteRPC`

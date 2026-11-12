@@ -33,6 +33,22 @@ jobs:
         shell: pwsh
         run: .\tests\Test-Scripts.ps1
 
+      - name: Regression checks in Windows PowerShell 5.1
+        if: success() || failure()
+        shell: powershell
+        run: |
+          .\tests\Test-EngineRegression.ps1
+          .\tests\Test-DashboardRegression.ps1
+          .\tests\Test-CiSafety.ps1
+
+      - name: Regression checks in PowerShell 7
+        if: success() || failure()
+        shell: pwsh
+        run: |
+          .\tests\Test-EngineRegression.ps1
+          .\tests\Test-DashboardRegression.ps1
+          .\tests\Test-CiSafety.ps1
+
       - name: PSScriptAnalyzer
         if: success() || failure()
         shell: pwsh
