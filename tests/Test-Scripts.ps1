@@ -243,8 +243,8 @@ Test-Case 'the background job scripts parse and call engine functions correctly'
 
 Test-Case 'the Remote Desktop Services wrapper compiles' {
     Initialize-Native
-    $type = 'SharedRdpV2.Wts' -as [type]
-    Assert-True ($null -ne $type) 'type SharedRdpV2.Wts is missing'
+    $type = 'SharedRdpV3.Wts' -as [type]
+    Assert-True ($null -ne $type) 'type SharedRdpV3.Wts is missing'
     foreach ($method in 'GetSessions', 'GetProcesses', 'AskSession', 'FormatAddress') {
         Assert-True (@($type.GetMethods() | Where-Object { $_.Name -eq $method }).Count -gt 0) ('method {0} is missing' -f $method)
     }
@@ -253,12 +253,12 @@ Test-Case 'the Remote Desktop Services wrapper compiles' {
 Test-Case 'client addresses start two bytes into WTS_CLIENT_ADDRESS, IPv4 and IPv6 alike' {
     $v4 = New-Object byte[] 20
     $v4[2] = 10; $v4[3] = 0; $v4[4] = 0; $v4[5] = 12
-    Assert-Equal '10.0.0.12' ([SharedRdpV2.Wts]::FormatAddress(2, $v4)) 'IPv4'
+    Assert-Equal '10.0.0.12' ([SharedRdpV3.Wts]::FormatAddress(2, $v4)) 'IPv4'
     $v6 = New-Object byte[] 20
     [Array]::Copy([System.Net.IPAddress]::Parse('2001:db8::5').GetAddressBytes(), 0, $v6, 2, 16)
-    Assert-Equal '2001:db8::5' ([SharedRdpV2.Wts]::FormatAddress(23, $v6)) 'IPv6'
-    Assert-True ($null -eq [SharedRdpV2.Wts]::FormatAddress(23, (New-Object byte[] 20))) 'an empty address should give none'
-    Assert-True ($null -eq [SharedRdpV2.Wts]::FormatAddress(0, $v4)) 'an unknown family should give none'
+    Assert-Equal '2001:db8::5' ([SharedRdpV3.Wts]::FormatAddress(23, $v6)) 'IPv6'
+    Assert-True ($null -eq [SharedRdpV3.Wts]::FormatAddress(23, (New-Object byte[] 20))) 'an empty address should give none'
+    Assert-True ($null -eq [SharedRdpV3.Wts]::FormatAddress(0, $v4)) 'an unknown family should give none'
 }
 
 Test-Case 'the dashboard window helper compiles' {

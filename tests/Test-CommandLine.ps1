@@ -89,6 +89,26 @@ function Invoke-StatusCheck {
     return $results
 }
 
+function Invoke-WithCiAccount {
+    # Own only the account created here: never remove an existing account when
+    # creation fails, or a replacement account that later reuses the same name.
+    param(
+        [Parameter(Mandatory = $true)] [System.Security.SecureString] $Password,
+        [Parameter(Mandatory = $true)] [scriptblock] $Action
+    )
+    $account = $null
+    try {
+        # Local account names are limited to 20 characters. A fresh name also
+        # lets independent checks run without sharing an account.
+        $name = 'srdp-' + [Guid]::NewGuid().ToString('N').Substring(0, 14)
+        $account = New-LocalUser -Name $name -Password $Password -AccountNeverExpires -PasswordNeverExpires -Description 'Temporary account for the SharedRDP checks' -ErrorAction Stop
+        & $Action $account
+    }
+    finally {
+        if ($null -ne $account) { Remove-LocalUser -SID $account.SID -ErrorAction SilentlyContinue }
+    }
+}
+
 Write-Line ('PowerShell {0} ({1}), {2}, running as {3}' -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition, [Environment]::OSVersion.VersionString, [System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
 
 # The engine's functions, for the checks below that call them directly.
@@ -135,7 +155,6 @@ else {
 
 # 3. Over the network with -Credential, as a temporary member of Remote Desktop Users.
 if ($CiSetup -and $address) {
-    $name = 'srdp-check'
     $bytes = New-Object byte[] 18
     $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     $random.GetBytes($bytes)
@@ -143,13 +162,15 @@ if ($CiSetup -and $address) {
     $secure = New-Object System.Security.SecureString
     foreach ($character in ('Aa1!' + [Convert]::ToBase64String($bytes)).ToCharArray()) { $secure.AppendChar($character) }
     try {
-        $null = New-LocalUser -Name $name -Password $secure -AccountNeverExpires -PasswordNeverExpires -Description 'Temporary account for the SharedRDP checks'
-        Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $name
-        foreach ($userName in @(('{0}\{1}' -f $env:COMPUTERNAME, $name), $name)) {
-            $credential = New-Object System.Management.Automation.PSCredential -ArgumentList $userName, $secure
-            $checked = @(Invoke-StatusCheck -Title ('This computer over the network as {0}, a member of Remote Desktop Users' -f $userName) -Arguments @{ ComputerName = $address; Credential = $credential })
-            if ($checked.Count -eq 1 -and $checked[0].Status -eq 'Unknown') {
-                Write-Problem -Warning -Title ('network check as {0}' -f $userName) -Message $checked[0].Error
+        Invoke-WithCiAccount -Password $secure -Action {
+            param($Account)
+            Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $Account
+            foreach ($userName in @(('{0}\{1}' -f $env:COMPUTERNAME, $Account.Name), $Account.Name)) {
+                $credential = New-Object System.Management.Automation.PSCredential -ArgumentList $userName, $secure
+                $checked = @(Invoke-StatusCheck -Title ('This computer over the network as {0}, a member of Remote Desktop Users' -f $userName) -Arguments @{ ComputerName = $address; Credential = $credential })
+                if ($checked.Count -eq 1 -and $checked[0].Status -eq 'Unknown') {
+                    Write-Problem -Warning -Title ('network check as {0}' -f $userName) -Message $checked[0].Error
+                }
             }
         }
     }
@@ -157,7 +178,7 @@ if ($CiSetup -and $address) {
         Write-Problem -Warning -Title 'temporary account' -Message $_.Exception.Message
     }
     finally {
-        Remove-LocalUser -Name $name -ErrorAction SilentlyContinue
+        $secure.Dispose()
     }
 }
 

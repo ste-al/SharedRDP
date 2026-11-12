@@ -12,7 +12,7 @@
     connect, ask the person in the session to let you take over, watch their
     screen, or get a notification when the machine is free.
 
-    Keep this file next to Connect-SharedRdp.ps1 (version 1.5 or later): every
+    Keep this file next to Connect-SharedRdp.ps1 (version 1.6 or later): every
     check runs through it, in the background, so the window never freezes.
 
     The password is kept in memory until the window closes and is never written
@@ -72,7 +72,7 @@ param(
     [string] $EnginePath
 )
 
-$script:DashboardVersion = '1.2'
+$script:DashboardVersion = '1.3'
 $script:Options = @{
     Host       = $ComputerName
     User       = $UserName
@@ -142,10 +142,10 @@ try {
         Export-ModuleMember -Function *
     }
     $null = $script:Engine | Import-Module -DisableNameChecking -PassThru
-    $needed = @('Get-HostStatus', 'Get-LastClientMap', 'Find-LastClient', 'Get-AskMessage', 'Get-SystemSessionMeaning', 'New-UnknownResult', 'Send-AskMessage', 'Test-SignInRejected', 'Format-MstscHost')
+    $needed = @('Get-HostStatus', 'Get-LastClientMap', 'Find-LastClient', 'Get-AskMessage', 'Get-SystemSessionMeaning', 'New-UnknownResult', 'Send-AskMessage', 'Test-SignInRejected', 'Format-MstscHost', 'Get-RdpConnectionLines')
     $missing = @($needed | Where-Object { -not $script:Engine.ExportedFunctions.ContainsKey($_) })
     if ($missing.Count -gt 0) {
-        throw ('this copy is too old for the dashboard (it lacks {0}); use version 1.5 or later' -f ($missing -join ', '))
+        throw ('this copy is too old for the dashboard (it lacks {0}); use version 1.6 or later' -f ($missing -join ', '))
     }
     Initialize-Native
     $script:EngineVersion = & $script:Engine { $script:ScriptVersion }
@@ -640,6 +640,9 @@ $script:LookupTask = $null
 $script:AskDeadline = Get-Date
 $script:AskUser = ''
 $script:Secrets = @{}            # request key -> SecureString, this run only
+$script:SecretRevisions = @{}    # request key -> form revision of its remembered secret
+$script:PasswordRevision = 0      # detects an edit while a background check runs
+$script:TempRdpFiles = New-Object System.Collections.ArrayList
 $script:ClientMaps = @{}         # request key -> @{ Map; Error; Time }
 $script:Recent = New-Object System.Collections.ArrayList
 $script:SavedSettings = $null    # the JSON last written, so unchanged settings are not rewritten
@@ -997,6 +1000,10 @@ function Get-FormRequest {
     $checkingAs = Get-CheckingIdentity -Credential $null
     if ($account) {
         $secure = $script:ui.PassBox.SecurePassword
+        if ($secure.Length -gt 0 -and $script:Secrets.ContainsKey($key) -and $script:SecretRevisions[$key] -eq $script:PasswordRevision) {
+            $secure.Dispose()
+            $secure = $script:Secrets[$key]
+        }
         if ($secure.Length -eq 0) {
             $secure.Dispose()
             $secure = $null
@@ -1009,6 +1016,7 @@ function Get-FormRequest {
         }
         if (-not $secure.IsReadOnly()) { $secure.MakeReadOnly() }
         $script:Secrets[$key] = $secure
+        $script:SecretRevisions[$key] = $script:PasswordRevision
         $credential = New-Object System.Management.Automation.PSCredential -ArgumentList $account, $secure
         # Show the account the way the machine sees it: a bare name is one of its
         # local accounts (HOST\name).
@@ -1034,7 +1042,7 @@ function Get-FormRequest {
     }
     return [pscustomobject]@{
         Key = $key; Host = $hostText; QueryHost = $split.Host; Account = $account
-        Credential = $credential; Target = $target; Settings = $settings
+        Credential = $credential; Target = $target; Settings = $settings; PasswordRevision = $script:PasswordRevision
     }
 }
 
@@ -1060,6 +1068,15 @@ function Set-Busy {
     }
 }
 
+function Test-SameRequestCredential {
+    # SecurePassword returns a new copy on each read. The form revision lets
+    # repeated clicks share one check without comparing or exposing passwords.
+    param($First, $Second)
+    if ($First.Key -ne $Second.Key) { return $false }
+    if ([object]::ReferenceEquals($First.Credential.Password, $Second.Credential.Password)) { return $true }
+    return ($null -ne $First.PasswordRevision -and $null -ne $Second.PasswordRevision -and $First.PasswordRevision -eq $Second.PasswordRevision)
+}
+
 function Start-Check {
     # One check runs at a time. A check asked for while another one runs is not
     # lost: for the same machine and password it takes that check's result,
@@ -1070,8 +1087,9 @@ function Start-Check {
     $running = $script:CheckTask
     if ($null -ne $running) {
         if ($Background) { return }
-        $sameSecret = [object]::ReferenceEquals($running.Context.Request.Credential.Password, $Request.Credential.Password)
+        $sameSecret = Test-SameRequestCredential -First $running.Context.Request -Second $Request
         if ($running.Context.Request.Key -eq $Request.Key -and $sameSecret) {
+            $script:QueuedRequest = $null
             if (-not $running.Context.Shown) {
                 $running.Context.Shown = $true
                 Set-Busy -On $true -HostName $Request.Host
@@ -1109,11 +1127,12 @@ function Complete-Check {
     $rejected = Test-SignInRejected -Code $result.ErrorCode
     $watchStopped = $false
     if ($null -ne $script:Watch -and $script:Watch.Request.Key -eq $request.Key) {
-        if ($rejected) {
+        if ($rejected -and (Test-SameRequestCredential -First $script:Watch.Request -Second $request)) {
             $script:Watch = $null
             $watchStopped = $true
         }
         else {
+            if (-not $rejected) { $script:Watch.Request = $request }
             $script:Watch.NextAt = (Get-Date).AddSeconds($script:Options.Refresh)
         }
     }
@@ -1136,7 +1155,7 @@ function Complete-Check {
     }
     $next = $script:QueuedRequest
     $script:QueuedRequest = $null
-    if ($null -ne $next) { Start-Check -Request $next }
+    if ($null -ne $next -and -not ($rejected -and (Test-SameRequestCredential -First $request -Second $next))) { Start-Check -Request $next }
     Update-Actions
     Update-Footer
 }
@@ -1149,8 +1168,11 @@ function Remove-RejectedSecret {
     $rejected = $Request.Credential.Password
     if ($script:Secrets.ContainsKey($Request.Key) -and [object]::ReferenceEquals($script:Secrets[$Request.Key], $rejected)) {
         $script:Secrets.Remove($Request.Key)
+        $script:SecretRevisions.Remove($Request.Key)
     }
-    if ($ClearForm -and (Get-FormKey) -eq $Request.Key) { $script:ui.PassBox.Clear() }
+    if ($ClearForm -and (Get-FormKey) -eq $Request.Key -and $null -ne $Request.PasswordRevision -and $Request.PasswordRevision -eq $script:PasswordRevision) {
+        $script:ui.PassBox.Clear()
+    }
     Update-PassHint
 }
 
@@ -1801,27 +1823,44 @@ function Start-RdpSession {
     # Remote Desktop with the machine and account filled in, keeping the person's
     # own defaults (Default.rdp) for screen size, drives and so on.
     param($Request)
+    $file = $null
+    $process = $null
     try {
-        $folder = Join-Path ([System.IO.Path]::GetTempPath()) 'SharedRdp'
-        if (-not (Test-Path -LiteralPath $folder)) { $null = New-Item -ItemType Directory -Path $folder -Force }
-        $file = Join-Path $folder ('{0}.rdp' -f ($Request.Host -replace '[^\w.-]', '_'))
-        $lines = New-Object System.Collections.Generic.List[string]
-        $template = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Default.rdp'
-        if (Test-Path -LiteralPath $template) {
-            foreach ($line in @(Get-Content -LiteralPath $template)) {
-                # A domain line would turn a bare account name into DOMAIN\name.
-                if (-not $line -or $line -match '^\s*(full address|alternate full address|username|domain)\s*:') { continue }
-                $lines.Add($line)
-            }
+        $templateLines = @()
+        $documents = [Environment]::GetFolderPath('MyDocuments')
+        if ($documents) {
+            $template = Join-Path $documents 'Default.rdp'
+            if (Test-Path -LiteralPath $template) { $templateLines = @(Get-Content -LiteralPath $template -ErrorAction Stop) }
         }
-        $lines.Add(('full address:s:{0}' -f (Format-MstscHost -Address $Request.Host)))
-        if ($Request.Account) { $lines.Add(('username:s:{0}' -f $Request.Account)) }
-        Set-Content -LiteralPath $file -Value $lines -Encoding Unicode
+        $lines = @(Get-RdpConnectionLines -Request $Request -TemplateLines $templateLines)
+        $folder = Join-Path ([System.IO.Path]::GetTempPath()) 'SharedRdp'
+        if (-not (Test-Path -LiteralPath $folder)) { $null = New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop }
+        # mstsc reads this asynchronously. Separate launches must never replace
+        # the account or target in a file another process has yet to read.
+        $file = Join-Path $folder ('{0}.rdp' -f [guid]::NewGuid().ToString('N'))
+        Set-Content -LiteralPath $file -Value $lines -Encoding Unicode -ErrorAction Stop
         Write-UiLog -Text ('Starting Remote Desktop: mstsc "{0}"' -f $file)
-        Start-Process -FilePath 'mstsc.exe' -ArgumentList ('"{0}"' -f $file)
+        $process = Start-Process -FilePath 'mstsc.exe' -ArgumentList ('"{0}"' -f $file) -PassThru -ErrorAction Stop
+        $null = $script:TempRdpFiles.Add(@{ Path = $file; Process = $process })
     }
     catch {
+        if ($file -and $null -eq $process) { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
         Show-Banner -Text ("Couldn't start Remote Desktop: {0}" -f $_.Exception.Message) -Kind Error
+    }
+}
+
+function Remove-CompletedRdpFiles {
+    # mstsc reads its file asynchronously. Even while closing the dashboard,
+    # leave a running client's file alone until that client has exited.
+    for ($i = $script:TempRdpFiles.Count - 1; $i -ge 0; $i--) {
+        $entry = $script:TempRdpFiles[$i]
+        try {
+            if (-not $entry.Process.HasExited) { continue }
+            Remove-Item -LiteralPath $entry.Path -Force -ErrorAction Stop
+            $entry.Process.Dispose()
+            $script:TempRdpFiles.RemoveAt($i)
+        }
+        catch { Write-Verbose ('Could not remove temporary Remote Desktop file: {0}' -f $_.Exception.Message) }
     }
 }
 
@@ -1943,6 +1982,14 @@ function Start-Watch {
     # schedule, also while other machines are checked, until it is free.
     param($Request)
     if ($null -eq $Request) { return }
+    $staleCredential = $Request.Account -and (
+        -not $script:Secrets.ContainsKey($Request.Key) -or
+        -not [object]::ReferenceEquals($script:Secrets[$Request.Key], $Request.Credential.Password)
+    )
+    if ($staleCredential -or (Test-SignInRejected -Code $script:Latest[$Request.Key].ErrorCode)) {
+        Show-Banner -Text ('Check {0} again with the corrected password before watching it.' -f $Request.Host) -Kind Warning
+        return
+    }
     $script:Watch = @{ Request = $Request; NextAt = (Get-Date).AddSeconds($script:Options.Refresh) }
     Show-Banner -Text ('Watching {0}: checking every {1} s. You get a notification when it is free; keep this window open.' -f $Request.Host, $script:Options.Refresh) -Kind Info -ActionText 'Stop watching' -Action { Stop-Watch }
     Update-Actions
@@ -2102,7 +2149,7 @@ $script:ui.FactsGrid.Add_SizeChanged({
 })
 $script:ui.HostBox.Add_TextChanged({ Invoke-Safely { Update-PassHint } })
 $script:ui.UserBox.Add_TextChanged({ Invoke-Safely { Update-PassHint } })
-$script:ui.PassBox.Add_PasswordChanged({ Invoke-Safely { Update-PassHint } })
+$script:ui.PassBox.Add_PasswordChanged({ Invoke-Safely { $script:PasswordRevision++; Update-PassHint } })
 # Clicks on recent machines are wired per entry in Show-RecentList. Enter or
 # Space checks the entry that has the keyboard focus; it is marked handled so
 # that Enter does not also press Check now.
@@ -2208,6 +2255,7 @@ $script:Clock.Add_Tick({
                 Start-Check -Request $script:Current.Request -Background
             }
         }
+        Remove-CompletedRdpFiles
         if ($null -ne $script:AskTask) { Update-AskBanner }
         Update-Footer
     }
@@ -2222,6 +2270,9 @@ $script:Window.Add_Closed({
         $script:TrayIcon.Visible = $false
         $script:TrayIcon.Dispose()
     }
+    Remove-CompletedRdpFiles
+    foreach ($entry in $script:TempRdpFiles) { $entry.Process.Dispose() }
+    if ($null -ne $script:AppIcon) { $script:AppIcon.Dispose() }
     try { $null = $script:Pool.BeginClose($null, $null) } catch { Write-Verbose 'The background pool was already closed.' }
 })
 
